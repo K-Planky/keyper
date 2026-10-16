@@ -6,8 +6,8 @@ use std::fmt;
 /// The Redis-compatible default listening port.
 pub const DEFAULT_PORT: u16 = 6379;
 
-/// Server configuration. Port zero requests an OS-assigned port once networking
-/// is implemented; the intended bind address is loopback only.
+/// Server configuration. Port zero requests an OS-assigned port. The bind
+/// address is loopback only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     pub port: u16,
