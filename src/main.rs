@@ -5,7 +5,7 @@ use keyper::config::{Cli, Config, parse_args};
 use keyper::server;
 
 const HELP: &str = "\
-Keyper — in-memory Redis-compatible service (PING only)
+Keyper — in-memory Redis-compatible service
 
 Usage: keyper [--port NUMBER]
        keyper --help
@@ -14,8 +14,9 @@ Options:
   --port NUMBER  Loopback listening port (default: 6379; 0: OS-assigned)
   -h, --help     Print this help
 
-Serves RESP2 PING on 127.0.0.1. Press Ctrl-C to stop.
-Other Redis commands are not implemented yet.";
+Serves RESP2 PING, SELECT, GET, SET, EXISTS on 127.0.0.1.
+SELECT is first-command-only; SET has no options. Press Ctrl-C to stop.
+Lists, transactions, Lua, and other Redis commands are not implemented yet.";
 
 async fn run(config: Config) -> io::Result<()> {
     let listener = server::bind(config).await.map_err(|error| {

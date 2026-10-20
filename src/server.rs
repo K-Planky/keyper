@@ -10,9 +10,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use crate::command;
+use crate::command::{Action, Session};
 use crate::config::Config;
 use crate::resp::{self, ReadError, Reply};
+use crate::state;
 
 pub const MAX_CONNECTIONS: usize = 256;
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,18 +29,34 @@ pub async fn bind(config: Config) -> io::Result<TcpListener> {
 /// panic is fatal, not a reason to silently resume with possibly uncertain state.
 /// The caller must not restart this service automatically after an error.
 ///
-/// At this PING-only boundary shutdown cancels all connection I/O. Later state
-/// operations must finish their atomic unit separately from connection draining.
+/// Shutdown cancels connection I/O and unstarted work, then waits for the owner
+/// to finish its current atomic operation. A drain timeout is fatal; callers must
+/// exit, not restart this service while a detached owner might still be running.
 pub async fn serve(
     listener: TcpListener,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> io::Result<()> {
+    serve_with_state(listener, shutdown, state::spawn()?).await
+}
+
+async fn serve_with_state(
+    listener: TcpListener,
+    shutdown: impl Future<Output = io::Result<()>>,
+    (state, mut owner): (state::Client, state::Completion),
+) -> io::Result<()> {
     let mut connections = JoinSet::new();
+    let mut owner_finished = false;
     tokio::pin!(shutdown);
     let outcome = loop {
         tokio::select! {
             biased;
             result = &mut shutdown => break result,
+            result = &mut owner => {
+                owner_finished = true;
+                break owner_outcome(result).and(Err(io::Error::other(
+                    "state owner stopped unexpectedly; service must stop"
+                )));
+            }
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
                     break Err(io::Error::other(format!("connection task failed: {error}")));
@@ -57,8 +74,9 @@ pub async fn serve(
                         error.kind(), format!("accept connection: {error}")
                     )),
                 };
+                let state = state.clone();
                 connections.spawn(async move {
-                    if let Err(error) = connection(stream).await {
+                    if let Err(error) = connection(stream, state).await {
                         eprintln!("keyper: connection {peer}: {error}");
                     }
                 });
@@ -68,33 +86,54 @@ pub async fn serve(
     drop(listener);
     connections.abort_all();
     let drained = timeout(SHUTDOWN_TIMEOUT, async {
+        let mut outcome = Ok(());
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result
                 && !error.is_cancelled()
             {
-                return Err(io::Error::other(format!(
+                outcome = Err(io::Error::other(format!(
                     "connection task failed during shutdown: {error}"
                 )));
             }
         }
-        Ok(())
+        // Every connection sender/receiver is now gone. Closing the last sender
+        // lets the owner discard canceled queued work and finish, without ever
+        // interrupting a mutation or waiting on socket I/O.
+        drop(state);
+        if !owner_finished {
+            outcome = outcome.and(owner_outcome(owner.await));
+        }
+        outcome
     })
     .await
     .unwrap_or_else(|_| {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "connection shutdown exceeded five seconds",
+            "service shutdown exceeded five seconds; process must exit",
         ))
     });
     outcome.and(drained)
 }
 
-async fn connection(stream: TcpStream) -> io::Result<()> {
+fn owner_outcome(
+    result: Result<io::Result<()>, tokio::sync::oneshot::error::RecvError>,
+) -> io::Result<()> {
+    result.unwrap_or_else(|_| Err(io::Error::other("state owner completion channel closed")))
+}
+
+async fn connection(stream: TcpStream, state: state::Client) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, stream);
+    let mut session = Session::default();
     loop {
         let (reply, close) = match resp::read_request(&mut reader).await {
-            Ok(Some(request)) => (command::execute(request), false),
+            Ok(Some(request)) => {
+                let reply = match session.prepare(request) {
+                    Action::Reply(reply) => reply,
+                    Action::Database(database, command) => state.execute(database, command).await?,
+                };
+                (reply, false)
+            }
             Ok(None) | Err(ReadError::Truncated) => return Ok(()),
             Err(ReadError::Protocol(message)) => (
                 Reply::Error(format!("ERR Protocol error: {message}").into_bytes()),
@@ -130,6 +169,37 @@ mod tests {
     use tokio::io::{AsyncReadExt, duplex};
 
     use super::*;
+
+    #[tokio::test]
+    async fn owner_panic_stops_even_idle_connections_instead_of_replacing_state() {
+        let listener = bind(Config { port: 0 }).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (fail, signal) = tokio::sync::oneshot::channel();
+        let owner = state::failing_owner(signal).unwrap();
+        let serving = serve_with_state(listener, std::future::pending(), owner);
+        let checking = async {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+            let mut pong = [0; 7];
+            client.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, b"+PONG\r\n");
+            fail.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, checking)
+        })
+        .await
+        .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("state owner panicked")
+        );
+        assert!(TcpStream::connect(address).await.is_err());
+    }
 
     #[tokio::test]
     async fn reply_write_handles_partial_writes_and_broken_connections() {

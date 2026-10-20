@@ -54,8 +54,11 @@ fn help_succeeds_and_describes_the_actual_boundary() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--port NUMBER"));
     assert!(help.contains("default: 6379"));
-    assert!(help.contains("RESP2 PING on 127.0.0.1"));
-    assert!(help.contains("Other Redis commands are not implemented yet"));
+    assert!(help.contains("RESP2 PING, SELECT, GET, SET, EXISTS on 127.0.0.1"));
+    assert!(help.contains("SELECT is first-command-only; SET has no options"));
+    assert!(
+        help.contains("Lists, transactions, Lua, and other Redis commands are not implemented yet")
+    );
 }
 
 #[test]

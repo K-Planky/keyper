@@ -1,52 +1,230 @@
-//! Command validation stays separate from wire framing and network lifecycle.
+//! Command admission and connection-local selection, separate from wire/state I/O.
 
 use crate::resp::{Reply, Request};
+use crate::state::DatabaseIndex;
 
-pub fn execute(request: Request) -> Reply {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DatabaseCommand {
+    Get(Vec<u8>),
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Exists(Vec<Vec<u8>>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Ping(Option<Vec<u8>>),
+    Select(Vec<u8>),
+    Database(DatabaseCommand),
+}
+
+pub(crate) enum Action {
+    Reply(Reply),
+    Database(DatabaseIndex, DatabaseCommand),
+}
+
+pub(crate) struct Session {
+    database: DatabaseIndex,
+    first_command: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            database: DatabaseIndex::default(),
+            first_command: true,
+        }
+    }
+}
+
+impl Session {
+    pub(crate) fn prepare(&mut self, request: Request) -> Action {
+        // Even an invalid/unknown/empty command consumes the selection window.
+        // Framing only calls us once the entire request has been decoded.
+        let first = std::mem::replace(&mut self.first_command, false);
+        let reply = match parse(request) {
+            Ok(Command::Select(index)) if first => match parse_database(&index) {
+                Ok(database) => {
+                    self.database = database;
+                    Reply::Simple(b"OK".to_vec())
+                }
+                Err(error) => error,
+            },
+            Ok(Command::Select(_)) => {
+                Reply::Error(b"ERR SELECT is only allowed as the first command".to_vec())
+            }
+            Ok(Command::Ping(None)) => Reply::Simple(b"PONG".to_vec()),
+            Ok(Command::Ping(Some(message))) => Reply::Bulk(Some(message)),
+            Ok(Command::Database(command)) => return Action::Database(self.database, command),
+            Err(error) => error,
+        };
+        Action::Reply(reply)
+    }
+}
+
+fn wrong_arity(command: &str) -> Reply {
+    Reply::Error(format!("ERR wrong number of arguments for '{command}' command").into_bytes())
+}
+
+// Validate arity before taking arguments. Value conversion stays separate so
+// later transaction admission need not confuse execution-time errors with arity.
+fn parse(request: Request) -> Result<Command, Reply> {
     let mut args = request.into_iter();
     let Some(name) = args.next() else {
-        return Reply::Error(b"ERR empty command".to_vec());
+        return Err(Reply::Error(b"ERR empty command".to_vec()));
     };
-    if !name.eq_ignore_ascii_case(b"PING") {
-        // Do not reflect arbitrary (possibly binary or sensitive) input.
-        return Reply::Error(b"ERR unknown command".to_vec());
+    if name.eq_ignore_ascii_case(b"PING") {
+        if args.len() > 1 {
+            return Err(wrong_arity("ping"));
+        }
+        Ok(Command::Ping(args.next()))
+    } else if name.eq_ignore_ascii_case(b"SELECT") {
+        if args.len() != 1 {
+            return Err(wrong_arity("select"));
+        }
+        Ok(Command::Select(args.next().unwrap()))
+    } else if name.eq_ignore_ascii_case(b"GET") {
+        if args.len() != 1 {
+            return Err(wrong_arity("get"));
+        }
+        Ok(Command::Database(DatabaseCommand::Get(
+            args.next().unwrap(),
+        )))
+    } else if name.eq_ignore_ascii_case(b"SET") {
+        if args.len() != 2 {
+            return Err(wrong_arity("set"));
+        }
+        Ok(Command::Database(DatabaseCommand::Set {
+            key: args.next().unwrap(),
+            value: args.next().unwrap(),
+        }))
+    } else if name.eq_ignore_ascii_case(b"EXISTS") {
+        if args.len() == 0 {
+            return Err(wrong_arity("exists"));
+        }
+        Ok(Command::Database(DatabaseCommand::Exists(args.collect())))
+    } else {
+        // Never reflect arbitrary (possibly binary or sensitive) input.
+        Err(Reply::Error(b"ERR unknown command".to_vec()))
     }
-    match (args.next(), args.next()) {
-        (None, None) => Reply::Simple(b"PONG".to_vec()),
-        (Some(message), None) => Reply::Bulk(Some(message)),
-        _ => Reply::Error(b"ERR wrong number of arguments for 'ping' command".to_vec()),
-    }
+}
+
+fn parse_database(bytes: &[u8]) -> Result<DatabaseIndex, Reply> {
+    // Redis integers are canonical decimal: no '+', whitespace, leading zero,
+    // '-0', fraction, or trailing bytes. Rust's integer parser alone is looser.
+    let index = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse::<i64>().ok())
+        .filter(|index| index.to_string().as_bytes() == bytes)
+        .ok_or_else(|| Reply::Error(b"ERR value is not an integer or out of range".to_vec()))?;
+    let index = i32::try_from(index).map_err(|_| {
+        Reply::Error(
+            b"ERR value is out of range, value must between -2147483648 and 2147483647".to_vec(),
+        )
+    })?;
+    DatabaseIndex::new(index).ok_or_else(|| Reply::Error(b"ERR DB index is out of range".to_vec()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn request(args: &[&[u8]]) -> Request {
+        args.iter().map(|arg| arg.to_vec()).collect()
+    }
+
     #[test]
     fn ping_is_ascii_case_insensitive_and_echoes_binary_or_empty_messages() {
         for name in [b"PING", b"ping", b"pInG"] {
-            assert_eq!(
-                execute(vec![name.to_vec()]),
-                Reply::Simple(b"PONG".to_vec())
-            );
-            for message in [vec![], b"\0\xff\r\n".to_vec()] {
+            assert_eq!(parse(request(&[name])), Ok(Command::Ping(None)));
+            for message in [&b""[..], b"\0\xff\r\n"] {
                 assert_eq!(
-                    execute(vec![name.to_vec(), message.clone()]),
-                    Reply::Bulk(Some(message))
+                    parse(request(&[name, message])),
+                    Ok(Command::Ping(Some(message.to_vec())))
                 );
             }
         }
     }
 
     #[test]
-    fn invalid_or_unsupported_commands_return_errors() {
+    fn admission_rejects_wrong_arity_and_set_options() {
         for args in [
             vec![],
-            vec![b"PING".to_vec(), vec![], vec![]],
-            vec![b"UNKNOWN\r\n".to_vec()],
-            vec![vec![]],
+            vec![&b"UNKNOWN\r\n"[..]],
+            vec![b""],
+            vec![b"PING", b"", b""],
+            vec![b"SELECT"],
+            vec![b"SELECT", b"0", b"1"],
+            vec![b"GET"],
+            vec![b"GET", b"a", b"b"],
+            vec![b"SET", b"a"],
+            vec![b"SET", b"a", b"v", b"NX"],
+            vec![b"EXISTS"],
         ] {
-            assert!(matches!(execute(args), Reply::Error(_)));
+            assert!(matches!(parse(request(&args)), Err(Reply::Error(_))));
         }
+    }
+
+    #[test]
+    fn select_accepts_only_canonical_in_range_indices() {
+        for index in 0..16 {
+            assert_eq!(
+                parse_database(index.to_string().as_bytes()),
+                Ok(DatabaseIndex::new(index).unwrap())
+            );
+        }
+        for index in [
+            &b""[..],
+            b"-1",
+            b"16",
+            b"00",
+            b"01",
+            b"-0",
+            b"+0",
+            b" 1",
+            b"1 ",
+            b"1.0",
+            b"1e0",
+            b"1\0",
+            b"\xff",
+            b"2147483648",
+            b"-2147483649",
+            b"9223372036854775808",
+        ] {
+            assert!(matches!(parse_database(index), Err(Reply::Error(_))));
+        }
+    }
+
+    #[test]
+    fn every_complete_attempt_consumes_selection_and_invalid_selection_keeps_default() {
+        for first in [
+            vec![&b"PING"[..]],
+            vec![b"PING", b"a", b"b"],
+            vec![b"UNKNOWN"],
+            vec![],
+            vec![b"SELECT", b"16"],
+            vec![b"SELECT"],
+            vec![b"GET"],
+        ] {
+            let mut session = Session::default();
+            session.prepare(request(&first));
+            assert!(matches!(
+                session.prepare(request(&[b"SELECT", b"15"])),
+                Action::Reply(Reply::Error(_))
+            ));
+            assert!(matches!(
+                session.prepare(request(&[b"GET", b"key"])),
+                Action::Database(db, _) if db == DatabaseIndex::default()
+            ));
+        }
+        let mut session = Session::default();
+        assert!(matches!(
+            session.prepare(request(&[b"sElEcT", b"15"])),
+            Action::Reply(Reply::Simple(_))
+        ));
+        session.prepare(request(&[b"SELECT", b"0"]));
+        assert!(matches!(
+            session.prepare(request(&[b"GET", b"key"])),
+            Action::Database(db, _) if db == DatabaseIndex::new(15).unwrap()
+        ));
     }
 }

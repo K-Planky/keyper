@@ -1,65 +1,17 @@
 //! Real TCP tests: owned loopback servers, bounded I/O, cleanup on failure.
 
-use std::future::Future;
+mod support;
+
 use std::io;
-use std::net::SocketAddr;
-use std::time::Duration;
 
 use keyper::{config::Config, resp, server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::task::JoinSet;
 
-const LIMIT: Duration = Duration::from_secs(5);
+use support::{TestServer, bounded};
+
 const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
-
-async fn bounded<F: Future>(future: F) -> F::Output {
-    timeout(LIMIT, future).await.expect("test I/O deadline")
-}
-
-struct TestServer {
-    address: SocketAddr,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<io::Result<()>>>,
-}
-
-impl TestServer {
-    async fn start() -> Self {
-        let listener = server::bind(Config { port: 0 }).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (send, receive) = oneshot::channel();
-        let task = tokio::spawn(server::serve(listener, async {
-            let _ = receive.await;
-            Ok(())
-        }));
-        Self {
-            address,
-            shutdown: Some(send),
-            task: Some(task),
-        }
-    }
-
-    async fn connect(&self) -> TcpStream {
-        bounded(TcpStream::connect(self.address)).await.unwrap()
-    }
-
-    async fn stop(mut self) {
-        self.shutdown.take().unwrap().send(()).unwrap();
-        bounded(self.task.as_mut().unwrap()).await.unwrap().unwrap();
-        self.task.take();
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        // Also cleans up when an assertion or bounded I/O fails.
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
 
 async fn send(stream: &mut TcpStream, bytes: &[u8]) {
     bounded(stream.write_all(bytes)).await.unwrap();
