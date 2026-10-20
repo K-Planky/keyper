@@ -4,8 +4,10 @@ A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, and RPUSH.**
 Sixteen in-memory databases hold strings or lists and are owned by one dedicated
-state thread, separate from asynchronous networking. Blocking pops, transactions,
-Lua, and crawler interoperability are **not implemented yet**.
+state thread, separate from asynchronous networking. **BLPOP/BRPOP state semantics
+and deadlines are implemented and tested internally, but not exposed over TCP**
+until socket cancellation/lifecycle integration is verified. Transactions, Lua,
+and crawler interoperability are not implemented yet.
 
 ## Prerequisites and build
 
@@ -67,7 +69,7 @@ redis-cli -2 -h 127.0.0.1 -p 6380 LPUSH queue a b
 # (integer) 2
 redis-cli -2 -h 127.0.0.1 -p 6380 RPUSH queue c d
 # (integer) 4
-# The list is now [b, a, c, d]; list pop/read commands are not implemented yet.
+# The list is now [b, a, c, d]; list pop/read commands are not exposed over TCP yet.
 redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
 # (error) WRONGTYPE Operation against a key holding the wrong kind of value
 redis-cli -2 -h 127.0.0.1 -p 6380 SET queue replaced
@@ -201,9 +203,14 @@ values, rejected SET options, atomic repeated-key EXISTS, concurrent SET/GET
 outcomes with cross-client real-time fences, list creation/lengths in all sixteen
 databases, type errors, SET-over-list, incomplete pushes, and concurrent variadic
 push/SET outcomes. State tests inspect internal left/right list order and binary
-contents; public pop-based ordering checks arrive with blocking pops. Owner tests
-exercise asynchronous backpressure, cancellation/lost replies, and fail-stop
-panic supervision.
+contents. Owner-level BLPOP/BRPOP tests cover both ends, key/type priority,
+FIFO/overlapping/duplicate keys, empty-list deletion, checked double timeouts,
+all sixteen namespaces, whole-push ordering, item accounting, and serialized
+producer/expiry outcomes. Controlled clocks check deadlines, rearming, indefinite
+waits, and no renewal after an empty recheck; a real dedicated-owner test checks
+its timer driver and bounded draining. These are not blocking-socket tests.
+Owner tests also exercise asynchronous backpressure, cancellation/lost replies,
+and fail-stop panic supervision.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
@@ -216,6 +223,8 @@ certification of future blocking/batch behavior or crawler compatibility.
 - `src/resp.rs`: request framing, resource bounds, and RESP2 reply encoding.
 - `src/command.rs`: command admission, PING, and connection-local selection.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
+- `src/state/blocking.rs`: pop eligibility, waiter indexes, owner loop, and deadlines.
+- `src/state/blocking/tests.rs`: deterministic owner-level blocking tests.
 - `src/server.rs`: loopback listener, connection tasks, writes, and supervision.
 - `src/main.rs`: arguments, two-worker Tokio entry point, signals, diagnostics.
 - `tests/cli.rs`, `tests/transport.rs`, `tests/databases.rs`: process/socket checks.
@@ -230,8 +239,8 @@ its lookup, SET at insertion/replacement, and EXISTS during its indivisible scan
 it never samples different moments for repeated arguments. A push linearizes
 after all insertions, when its resulting length is captured; a wrong-type push
 linearizes at the type check without mutation. No other operation can observe a
-partial push. Future waiter service must run after this complete unit and its
-reply capture, not between elements. SELECT linearizes at the connection-local
+partial push. Waiter service runs after this complete unit and its reply capture,
+not between elements. SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
 touching data. Other clients cannot change a connection's selected database.
 PING is not in histories.
@@ -255,14 +264,70 @@ retry. An owner panic/channel failure stops serving rather than replacing state;
 an explicit restart loses all data. This is not exactly-once delivery, persistence,
 or crash recovery.
 
-## Remaining work (not implemented)
+### Blocking-pop owner contract (TCP integration pending)
 
-Remaining core commands are BLPOP and BRPOP; blocking pops accept one to five
-keys and a double-precision timeout. The planned owner will atomically
-check/register waits, then remain available to other clients. Waiters recheck
-keys left to right after complete atomic units, with FIFO priority and one
-terminal outcome each. No state ownership may span a blocking wait. Blocking
-linearizability, cancellation races, and atomic-batch integration remain unverified.
+The internal BLPOP/BRPOP operations accept **one to five key arguments** and a
+double-precision timeout in seconds. Duplicate keys count toward five, but are
+registered once in their original priority order. Both directions scan keys
+left to right: an earlier nonempty list wins over a later wrong type; an earlier
+wrong type fails without consuming from a later list. BLPOP removes the head,
+BRPOP the tail. Success returns a two-bulk-string array `[key, value]`, removes
+an emptied list key, and linearizes at the indivisible eligibility/removal check.
+
+Timeout conversion and the checked monotonic deadline precede any removal.
+Signed zero means indefinite waiting; positive fractions round up to milliseconds
+(e.g. `0.0011` seconds becomes 2 ms). Negative, malformed, nonfinite, overflowing,
+and nonzero-underflow-to-zero inputs fail without mutation. Duration and platform
+Instant range are checked. The original deadline starts when the owner begins
+that command, not when queued bytes arrive, and never renews after rechecks.
+
+An empty attempt and waiter registration are one owner unit: a producer cannot
+slip between them and cause a lost wakeup. The owner then releases execution,
+parks on work or its next deadline, and remains available for other commands
+and databases. A current-thread Tokio timer driver lives on the dedicated owner
+thread; synchronous state work stays off network workers. No map reference or
+execution ownership spans a socket or list wait.
+
+After a complete successful push and captured length reply, eligible waiters
+run in registration order. Each rechecks its own keys left to right against the
+committed state, so variadic LPUSH exposes its final head, never its first
+intermediate insertion. Reentering creates a new FIFO position. Only committed
+nonempty lists trigger service: SET, failed pushes, or a list filled then
+emptied/replaced within one unit do not themselves wake a waiter. The service
+boundary is tested with simulated multi-command units, **not yet EXEC/EVAL**.
+Future batch integration must preserve this rule. If an atomic batch fills b
+then a for a waiter on `[a, b]`, the recheck must select a; this project's explicit
+linearizability requirement takes precedence over Redis prose describing
+first-pushed-key priority. No caller may observe a partial atomic batch.
+
+The owner alone decides terminal outcomes and removes every key/deadline index
+before replying. Expiry returns a **null array**, never before the original
+deadline; scheduling may delay it. A timeout linearization witness is the empty
+observation at registration during its pending interval. At an owner-loop
+boundary, an already-due timer takes priority over queued work; an executing
+producer completes its whole unit and waiter service before the next timer
+check. Tests explicitly exercise both serialized orders instead of guessing a
+race winner from sleeps. Stale expiry cannot consume or undo a committed item.
+
+Eligibility is O(K) for K supplied keys (at most five). Per-key waiter indexes
+avoid scanning unrelated databases/keys; ordered waiter/deadline bookkeeping
+adds logarithmic costs in pending waiters, plus eligible rechecks and byte costs.
+No polling or task per timeout is needed. Empty rechecks preserve FIFO position
+and deadline; terminal cleanup removes indexes rather than leaving tombstones.
+
+**Current boundary:** TCP BLPOP/BRPOP attempts return an explicit `ERR` without
+accessing lists. Dropped internal reply receivers cannot consume on a later
+recheck, but prompt cancellation notification is not implemented: a canceled
+registration can remain until readiness, expiry, or owner shutdown. Socket EOF,
+blocking reply delivery, cancellation races, and bounded pending-connection
+shutdown must be integrated/tested before TCP exposure. Closing the owner work
+channel already drops all pending waits, including indefinite ones. A reply lost
+after removal never restores/requeues an item.
+
+## Remaining work
+
+Next: expose BLPOP/BRPOP with verified socket cancellation and lifecycle cleanup.
+Blocking-socket concurrency and actual atomic-batch integration remain unverified.
 
 Later work includes ordered pipelining, audited extra commands, genuine Lua 5.1,
 and MULTI/EXEC/DISCARD for an **unmodified** external crawler. Crawler sources and

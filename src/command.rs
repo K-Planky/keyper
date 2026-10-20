@@ -22,6 +22,11 @@ pub(crate) enum DatabaseCommand {
         key: Vec<u8>,
         values: Vec<Vec<u8>>,
     },
+    Pop {
+        end: ListEnd,
+        keys: Vec<Vec<u8>>,
+        timeout: Vec<u8>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,6 +73,11 @@ impl Session {
             }
             Ok(Command::Ping(None)) => Reply::Simple(b"PONG".to_vec()),
             Ok(Command::Ping(Some(message))) => Reply::Bulk(Some(message)),
+            // The owner boundary is tested separately. Keep sockets explicitly
+            // unavailable until disconnect/cancellation integration is verified.
+            Ok(Command::Database(DatabaseCommand::Pop { .. })) => {
+                Reply::Error(b"ERR blocking pops are not exposed over TCP yet".to_vec())
+            }
             Ok(Command::Database(command)) => return Action::Database(self.database, command),
             Err(error) => error,
         };
@@ -129,6 +139,26 @@ fn parse(request: Request) -> Result<Command, Reply> {
             end,
             key: args.next().unwrap(),
             values: args.collect(),
+        }))
+    } else if name.eq_ignore_ascii_case(b"BLPOP") || name.eq_ignore_ascii_case(b"BRPOP") {
+        let (end, command) = if name.eq_ignore_ascii_case(b"BLPOP") {
+            (ListEnd::Left, "blpop")
+        } else {
+            (ListEnd::Right, "brpop")
+        };
+        if args.len() < 2 {
+            return Err(wrong_arity(command));
+        }
+        if args.len() > 6 {
+            return Err(Reply::Error(
+                b"ERR blocking pop supports at most 5 keys".to_vec(),
+            ));
+        }
+        let timeout = args.next_back().unwrap();
+        Ok(Command::Database(DatabaseCommand::Pop {
+            end,
+            keys: args.collect(),
+            timeout,
         }))
     } else {
         // Never reflect arbitrary (possibly binary or sensitive) input.
@@ -207,6 +237,41 @@ mod tests {
                     values: vec![vec![], b"a\r\n".to_vec(), b"a\r\n".to_vec()],
                 }))
             );
+        }
+    }
+
+    #[test]
+    fn pop_admission_preserves_keys_and_defers_timeout_conversion_but_tcp_is_gated() {
+        for (name, end) in [(b"bLpOp", ListEnd::Left), (b"bRpOp", ListEnd::Right)] {
+            for count in 1..=5 {
+                let mut args = vec![&name[..]];
+                args.extend(vec![&b"\0\xff"[..]; count]);
+                args.push(b"not-a-float");
+                assert_eq!(
+                    parse(request(&args)),
+                    Ok(Command::Database(DatabaseCommand::Pop {
+                        end,
+                        keys: vec![b"\0\xff".to_vec(); count],
+                        timeout: b"not-a-float".to_vec(),
+                    }))
+                );
+            }
+            for args in [
+                vec![&name[..]],
+                vec![name, b"0"],
+                vec![name, b"a", b"b", b"c", b"d", b"e", b"f", b"0"],
+            ] {
+                assert!(matches!(parse(request(&args)), Err(Reply::Error(_))));
+            }
+            let mut session = Session::default();
+            assert!(matches!(
+                session.prepare(request(&[name, b"k", b"0"])),
+                Action::Reply(Reply::Error(_))
+            ));
+            assert!(matches!(
+                session.prepare(request(&[b"SELECT", b"15"])),
+                Action::Reply(Reply::Error(_))
+            ));
         }
     }
 

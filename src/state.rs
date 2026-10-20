@@ -10,6 +10,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::command::{DatabaseCommand, ListEnd};
 use crate::resp::Reply;
 
+mod blocking;
+
+use blocking::Owner;
+
 const DATABASES: usize = 16;
 pub(crate) const WORK_CAPACITY: usize = 256;
 
@@ -67,7 +71,7 @@ impl Databases {
                     return wrong_type();
                 };
                 // Complete every insertion and capture the resulting length as
-                // one atomic unit. Future waiter service must run only after it.
+                // one atomic unit. Owner waiter service runs only after it.
                 for value in values {
                     match end {
                         ListEnd::Left => list.push_front(value),
@@ -77,6 +81,14 @@ impl Databases {
                 // VecDeque's nonzero-sized elements bound length below i64::MAX
                 // on supported 32/64-bit targets, before allocation can succeed.
                 Reply::Integer(list.len() as i64)
+            }
+            DatabaseCommand::Pop { end, keys, timeout } => {
+                // Nonblocking execution for an isolated unit. Ordinary owner
+                // requests use Owner::process to register an empty attempt.
+                match blocking::Pop::new(end, keys, &timeout, tokio::time::Instant::now()) {
+                    Ok(pop) => self.pop(database, &pop).unwrap_or(Reply::Array(None)),
+                    Err(error) => error,
+                }
             }
         }
     }
@@ -121,7 +133,7 @@ pub(crate) fn spawn() -> io::Result<(Client, Completion)> {
 }
 
 fn spawn_with(
-    run: impl FnOnce(mpsc::Receiver<Work>) + Send + 'static,
+    run: impl FnOnce(mpsc::Receiver<Work>) -> io::Result<()> + Send + 'static,
 ) -> io::Result<(Client, Completion)> {
     let (work, receive) = mpsc::channel(WORK_CAPACITY);
     let (finished, completion) = oneshot::channel();
@@ -130,25 +142,23 @@ fn spawn_with(
         .spawn(move || {
             // Report panic only to fail-stop supervision, never to reset state
             // or turn uncertain execution into a normal client error.
-            let outcome = catch_unwind(AssertUnwindSafe(|| run(receive)))
-                .map_err(|_| io::Error::other("state owner panicked; service must stop"));
+            let outcome = catch_unwind(AssertUnwindSafe(|| run(receive))).unwrap_or_else(|_| {
+                Err(io::Error::other("state owner panicked; service must stop"))
+            });
             let _ = finished.send(outcome);
         })
         .map_err(|error| io::Error::new(error.kind(), format!("start state owner: {error}")))?;
     Ok((Client { work }, completion))
 }
 
-fn run(mut work: mpsc::Receiver<Work>) {
-    let mut databases = Databases::default();
-    // Only this OS thread blocks. Tokio tasks use asynchronous bounded sends.
-    // Dropping all clients closes the queue; remaining unstarted/canceled work
-    // is skipped, and an already-started operation is always allowed to finish.
-    while let Some(work) = work.blocking_recv() {
-        if !work.reply.is_closed() {
-            let reply = databases.execute(work.database, work.command);
-            let _ = work.reply.send(reply); // Lost reply is not rollback/retry.
-        }
-    }
+fn run(work: mpsc::Receiver<Work>) -> io::Result<()> {
+    // A timer driver on this same dedicated thread parks only between atomic
+    // units. Synchronous state work (and later Lua) never runs on network workers.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(Owner::default().run(work));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,7 +345,7 @@ mod tests {
         let (release, gate) = oneshot::channel();
         let (client, done) = spawn_with(move |work| {
             gate.blocking_recv().unwrap();
-            run(work);
+            run(work)
         })
         .unwrap();
         let mut replies = vec![];
@@ -419,7 +429,7 @@ mod tests {
         .unwrap();
         let (finished, done) = oneshot::channel();
         thread::spawn(move || {
-            run(receive);
+            run(receive).unwrap();
             finished.send(()).unwrap();
         });
         // GET is a fence after SET, but the SET reply is never read. Dropping
