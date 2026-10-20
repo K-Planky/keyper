@@ -1,9 +1,10 @@
 //! Eligibility, waiter indexes, and terminal decisions belong to the state owner.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use super::{DATABASES, DatabaseIndex, Databases, Value, Work, wrong_type};
@@ -121,10 +122,20 @@ pub(super) struct Owner {
     waiters: BTreeMap<u64, Waiter>,
     watching: [HashMap<Vec<u8>, BTreeSet<u64>>; DATABASES],
     deadlines: BTreeSet<(Instant, u64)>,
+    #[cfg(test)]
+    waiter_count: Option<tokio::sync::watch::Sender<usize>>,
 }
 
 impl Owner {
-    pub(super) async fn run(mut self, mut work: mpsc::Receiver<Work>) {
+    #[cfg(test)]
+    pub(super) fn observed(count: tokio::sync::watch::Sender<usize>) -> Self {
+        Self {
+            waiter_count: Some(count),
+            ..Self::default()
+        }
+    }
+
+    pub(super) async fn run(mut self, mut work: mpsc::Receiver<Work>, canceled: Arc<Notify>) {
         loop {
             self.expire(Instant::now());
             let work = if let Some(&(deadline, _)) = self.deadlines.first() {
@@ -132,10 +143,21 @@ impl Owner {
                     // Expiry wins if both events are ready at this boundary.
                     biased;
                     _ = sleep_until(deadline) => continue,
+                    _ = canceled.notified() => {
+                        self.reap_closed();
+                        continue;
+                    }
                     work = work.recv() => work,
                 }
             } else {
-                work.recv().await
+                tokio::select! {
+                    biased;
+                    _ = canceled.notified() => {
+                        self.reap_closed();
+                        continue;
+                    }
+                    work = work.recv() => work,
+                }
             };
             let Some(work) = work else {
                 // Closing all clients ends indefinite waits too. Drop reply
@@ -199,6 +221,30 @@ impl Owner {
             self.deadlines.insert((deadline, id));
         }
         self.waiters.insert(id, waiter);
+        #[cfg(test)]
+        self.report_waiters();
+    }
+
+    fn reap_closed(&mut self) {
+        // Disconnects are rare relative to commands, and the network layer caps
+        // pending clients at 256. A coalesced O(W) sweep avoids extra request IDs,
+        // cleanup channels, and cancellation tasks. Readiness still uses indexes.
+        let closed: Vec<_> = self
+            .waiters
+            .iter()
+            .filter(|(_, waiter)| waiter.reply.is_closed())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in closed {
+            self.remove(id);
+        }
+    }
+
+    #[cfg(test)]
+    fn report_waiters(&self) {
+        if let Some(count) = &self.waiter_count {
+            count.send_replace(self.waiters.len());
+        }
     }
 
     /// Every terminal path removes all indexes before delivering an outcome.
@@ -216,6 +262,8 @@ impl Owner {
         if let Some(deadline) = waiter.pop.deadline {
             self.deadlines.remove(&(deadline, id));
         }
+        #[cfg(test)]
+        self.report_waiters();
         waiter
     }
 

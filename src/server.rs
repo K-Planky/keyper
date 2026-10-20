@@ -5,20 +5,22 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::command::{Action, Session};
 use crate::config::Config;
-use crate::resp::{self, ReadError, Reply};
+use crate::resp::{ReadError, Reply};
 use crate::state;
+
+mod input;
+use input::Input;
 
 pub const MAX_CONNECTIONS: usize = 256;
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_BUFFER_BYTES: usize = 8 * 1024;
 
 pub async fn bind(config: Config) -> io::Result<TcpListener> {
     TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port)).await
@@ -123,14 +125,22 @@ fn owner_outcome(
 
 async fn connection(stream: TcpStream, state: state::Client) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, stream);
+    let (reader, mut writer) = stream.into_split();
+    let mut input = Input::new(reader);
     let mut session = Session::default();
     loop {
-        let (reply, close) = match resp::read_request(&mut reader).await {
+        let (reply, close) = match input.request().await {
             Ok(Some(request)) => {
                 let reply = match session.prepare(request) {
                     Action::Reply(reply) => reply,
-                    Action::Database(database, command) => state.execute(database, command).await?,
+                    Action::Database(database, command) => {
+                        let Some(reply) =
+                            while_connected(&mut input, state.execute(database, command)).await?
+                        else {
+                            return Ok(());
+                        };
+                        reply
+                    }
                 };
                 (reply, false)
             }
@@ -146,13 +156,28 @@ async fn connection(stream: TcpStream, state: state::Client) -> io::Result<()> {
                 ));
             }
         };
-        // One owned response at a time; never retain shared state across writes.
-        // BufReader retains any coalesced bytes for the next request, but full
-        // blocking-command/pipeline lifecycle guarantees belong to later steps.
-        write_reply(reader.get_mut(), &reply).await?;
+        // EOF also cancels slow writes; an already-committed operation is never
+        // undone or retried. Queued commands cannot overtake this owned reply.
+        if while_connected(&mut input, write_reply(&mut writer, &reply))
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
         if close {
             return Ok(());
         }
+    }
+}
+
+async fn while_connected<T>(
+    input: &mut Input,
+    operation: impl Future<Output = io::Result<T>>,
+) -> io::Result<Option<T>> {
+    tokio::select! {
+        biased;
+        closed = input.until_closed() => closed.map(|()| None),
+        result = operation => result.map(Some),
     }
 }
 
@@ -165,75 +190,6 @@ async fn write_reply<W: AsyncWrite + Unpin>(writer: &mut W, reply: &Reply) -> io
 }
 
 #[cfg(test)]
-mod tests {
-    use tokio::io::{AsyncReadExt, duplex};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn owner_panic_stops_even_idle_connections_instead_of_replacing_state() {
-        let listener = bind(Config { port: 0 }).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (fail, signal) = tokio::sync::oneshot::channel();
-        let owner = state::failing_owner(signal).unwrap();
-        let serving = serve_with_state(listener, std::future::pending(), owner);
-        let checking = async {
-            let mut client = TcpStream::connect(address).await.unwrap();
-            client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
-            let mut pong = [0; 7];
-            client.read_exact(&mut pong).await.unwrap();
-            assert_eq!(&pong, b"+PONG\r\n");
-            fail.send(()).unwrap();
-            let mut byte = [0];
-            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
-        };
-        let (result, ()) = timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, checking)
-        })
-        .await
-        .unwrap();
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("state owner panicked")
-        );
-        assert!(TcpStream::connect(address).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn reply_write_handles_partial_writes_and_broken_connections() {
-        let reply = Reply::Bulk(Some(b"\0\xff\r\n".to_vec()));
-        let expected = reply.encode();
-        let (mut writer, mut reader) = duplex(1);
-        let writing = tokio::spawn(async move { write_reply(&mut writer, &reply).await });
-        let mut received = vec![0; expected.len()];
-        timeout(Duration::from_secs(2), reader.read_exact(&mut received))
-            .await
-            .unwrap()
-            .unwrap();
-        writing.await.unwrap().unwrap();
-        assert_eq!(received, expected);
-
-        let (mut writer, reader) = duplex(1);
-        drop(reader);
-        assert_eq!(
-            write_reply(&mut writer, &Reply::Integer(1))
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::BrokenPipe
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn nonreading_peer_has_a_bounded_write_deadline() {
-        let (mut writer, _reader) = duplex(1);
-        let start = tokio::time::Instant::now();
-        let error = write_reply(&mut writer, &Reply::Integer(1))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(start.elapsed(), WRITE_TIMEOUT);
-    }
-}
+mod blocking_tests;
+#[cfg(test)]
+mod tests;

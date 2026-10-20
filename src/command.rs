@@ -73,11 +73,6 @@ impl Session {
             }
             Ok(Command::Ping(None)) => Reply::Simple(b"PONG".to_vec()),
             Ok(Command::Ping(Some(message))) => Reply::Bulk(Some(message)),
-            // The owner boundary is tested separately. Keep sockets explicitly
-            // unavailable until disconnect/cancellation integration is verified.
-            Ok(Command::Database(DatabaseCommand::Pop { .. })) => {
-                Reply::Error(b"ERR blocking pops are not exposed over TCP yet".to_vec())
-            }
             Ok(Command::Database(command)) => return Action::Database(self.database, command),
             Err(error) => error,
         };
@@ -241,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn pop_admission_preserves_keys_and_defers_timeout_conversion_but_tcp_is_gated() {
+    fn pop_admission_preserves_keys_and_defers_timeout_conversion() {
         for (name, end) in [(b"bLpOp", ListEnd::Left), (b"bRpOp", ListEnd::Right)] {
             for count in 1..=5 {
                 let mut args = vec![&name[..]];
@@ -266,7 +261,7 @@ mod tests {
             let mut session = Session::default();
             assert!(matches!(
                 session.prepare(request(&[name, b"k", b"0"])),
-                Action::Reply(Reply::Error(_))
+                Action::Database(_, DatabaseCommand::Pop { .. })
             ));
             assert!(matches!(
                 session.prepare(request(&[b"SELECT", b"15"])),

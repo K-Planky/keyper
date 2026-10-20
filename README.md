@@ -2,12 +2,11 @@
 
 A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
-**Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, and RPUSH.**
-Sixteen in-memory databases hold strings or lists and are owned by one dedicated
-state thread, separate from asynchronous networking. **BLPOP/BRPOP state semantics
-and deadlines are implemented and tested internally, but not exposed over TCP**
-until socket cancellation/lifecycle integration is verified. Transactions, Lua,
-and crawler interoperability are not implemented yet.
+**Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
+BLPOP, and BRPOP.** Sixteen in-memory databases hold strings or lists and belong
+to one dedicated state thread, separate from asynchronous networking. Blocking
+pops include checked deadlines, disconnect cancellation, and bounded shutdown.
+Transactions, Lua, and crawler interoperability are not implemented yet.
 
 ## Prerequisites and build
 
@@ -69,13 +68,38 @@ redis-cli -2 -h 127.0.0.1 -p 6380 LPUSH queue a b
 # (integer) 2
 redis-cli -2 -h 127.0.0.1 -p 6380 RPUSH queue c d
 # (integer) 4
-# The list is now [b, a, c, d]; list pop/read commands are not exposed over TCP yet.
+# The list is now [b, a, c, d].
+redis-cli -2 -h 127.0.0.1 -p 6380 BRPOP queue 0
+# 1) "queue"
+# 2) "d"
+redis-cli -2 -h 127.0.0.1 -p 6380 BLPOP queue 0
+# 1) "queue"
+# 2) "b"
 redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
 # (error) WRONGTYPE Operation against a key holding the wrong kind of value
 redis-cli -2 -h 127.0.0.1 -p 6380 SET queue replaced
 # OK
 redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
 # "replaced"
+```
+
+To demonstrate blocking, run this in another terminal:
+
+```sh
+redis-cli -2 -h 127.0.0.1 -p 6380 BLPOP blocking-demo 0
+# Waits indefinitely (Ctrl-C cancels this client).
+```
+
+While it waits, the original terminal can still PING, access other databases,
+and release it:
+
+```sh
+redis-cli -2 -h 127.0.0.1 -p 6380 PING
+# PONG
+redis-cli -2 -h 127.0.0.1 -p 6380 RPUSH blocking-demo delivered
+# (integer) 1; the waiting terminal prints ["blocking-demo", "delivered"].
+redis-cli -2 -h 127.0.0.1 -p 6380 BRPOP missing-list 0.05
+# (nil) after at least 50 ms (plus scheduling/transport time).
 ```
 
 Each invocation opens a new connection. `-n 15` selects database 15 at startup;
@@ -97,7 +121,8 @@ executing state operation finish. Connection and owner draining share a
 five-second deadline. Failure to drain is fatal: the executable exits with
 status 1, never resets/replaces state and resumes. Embedders of `server::serve`
 must likewise exit on failure rather than restart while an owner might still be
-running. Future blocking/Lua shutdown behavior is not yet certified. There is no
+running. Pending finite/indefinite blocking requests are canceled without waiting
+for a producer; future Lua shutdown behavior is not yet certified. There is no
 persistence; every explicit restart starts empty.
 
 ### Configuration and exposure
@@ -127,6 +152,8 @@ persistence; every explicit restart starts empty.
 | `EXISTS key [key ...]` | Integer count for any type; repeated existing keys count repeatedly |
 | `LPUSH key value [value ...]` | Integer length after inserting all values at the head, in argument order |
 | `RPUSH key value [value ...]` | Integer length after inserting all values at the tail, in argument order |
+| `BLPOP key [key ...] timeout` | Two-bulk-string array `[key, head]`, or null array on timeout; 1–5 keys |
+| `BRPOP key [key ...] timeout` | Two-bulk-string array `[key, tail]`, or null array on timeout; 1–5 keys |
 
 Command names are ASCII case-insensitive; keys/values are opaque bytes, including
 empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
@@ -145,11 +172,11 @@ Requests must be arrays of **non-null bulk strings**. The decoder consumes one
 complete request at a time, preserving bytes following it. Partial TCP reads and
 coalesced frames work without losing boundaries. The encoder supports simple
 strings, errors, signed 64-bit integers, bulk/null bulk strings, and nested/null
-arrays; array replies are not yet exposed as commands. Null and empty values
-remain distinct. CR/LF in status/error text are replaced with spaces to
+arrays; blocking pops expose pair/null arrays. Null and empty values remain
+distinct. CR/LF in status/error text are replaced with spaces to
 prevent reply injection; bulk data is never altered.
 
-Malformed framing or a resource-limit violation produces a best-effort
+Malformed framing or a request-framing limit violation produces a best-effort
 `ERR Protocol error` reply and closes that connection without resynchronizing.
 EOF within a request discards the incomplete request and closes silently; EOF
 between requests closes normally. Socket/write failures affect only that client;
@@ -167,8 +194,13 @@ work; they are not the real Redis server's defaults:
 - **8 MiB** per bulk string; **16 MiB** per encoded request including headers.
 - At most **20 decimal digits** in each length header; sizes are checked before
   allocation. Lengths are unsigned decimal; negative/null request lengths fail.
-- One request/reply in execution per connection, an **8 KiB** read-ahead buffer,
+- One request/reply in execution per connection, an **8 KiB** socket read buffer,
   and a **five-second** deadline for writing each complete reply.
+- While execution or writing waits, up to **16 MiB** of additional input is queued
+  without execution. Reads continue to detect EOF even behind pipelined bytes.
+  Exceeding this queue closes the connection without a guaranteed error reply,
+  cancels unstarted/pending work, and discards queued commands. This explicit
+  overload policy avoids an unbounded buffer or EOF hidden behind a full queue.
 - A shared work channel with **256** queued operations and one one-shot reply
   channel per operation. Full-queue sends await capacity without blocking Tokio.
   Stored database contents have no total size limit or eviction policy.
@@ -178,10 +210,12 @@ bounded memory. A slow reader cannot retain database ownership or block another
 connection's I/O. This is bounded per connection, not protection against a
 hostile local user exhausting available memory.
 
-The present read/execute/write loop preserves order for coalesced commands;
-full pipeline lifecycle, actual client startup, disconnect-during-blocking, and
-transaction guarantees remain later work. Do not infer crawler compatibility
-from these transport tests.
+The read/execute/write loop preserves connection order, including across a
+blocking pop: queued commands cannot unblock their own connection or overtake
+its current command/reply. Separate connections progress independently. EOF
+ends the session, discarding unexecuted input rather than continuing a half-closed
+pipeline. Full pipeline/client-startup verification and transactions remain
+later work; do not infer crawler compatibility from the blocking socket tests.
 
 ## Development checks
 
@@ -208,14 +242,20 @@ FIFO/overlapping/duplicate keys, empty-list deletion, checked double timeouts,
 all sixteen namespaces, whole-push ordering, item accounting, and serialized
 producer/expiry outcomes. Controlled clocks check deadlines, rearming, indefinite
 waits, and no renewal after an empty recheck; a real dedicated-owner test checks
-its timer driver and bounded draining. These are not blocking-socket tests.
-Owner tests also exercise asynchronous backpressure, cancellation/lost replies,
-and fail-stop panic supervision.
+its timer driver and bounded draining. Real-socket blocking tests also cover
+unblocking, overlapping FIFO waiters/reentry, independent databases, 32 consumers
+with concurrent producers, queued-input ordering, prompt EOF cleanup without
+producers, finite timeout/producer/disconnect races, oversized queued input,
+large unread/lost pop replies, pending shutdown, and empty restart. A test-only
+watch reports actual owner registration counts for synchronization; it does not
+alter replies or execution. Owner tests inspect all cleanup indexes and verify
+cancellation notification without any subsequent commands. Owner tests also
+exercise asynchronous backpressure, lost replies, and fail-stop panic supervision.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
 Repeated schedules supplement the ownership argument below, not a proof or
-certification of future blocking/batch behavior or crawler compatibility.
+certification of future batch behavior or crawler compatibility.
 
 ### Layout
 
@@ -225,7 +265,9 @@ certification of future blocking/batch behavior or crawler compatibility.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
 - `src/state/blocking.rs`: pop eligibility, waiter indexes, owner loop, and deadlines.
 - `src/state/blocking/tests.rs`: deterministic owner-level blocking tests.
-- `src/server.rs`: loopback listener, connection tasks, writes, and supervision.
+- `src/server.rs`: loopback listener, ordered connection tasks, writes, supervision.
+- `src/server/input.rs`: bounded input queue and EOF detection during waits/writes.
+- `src/server/tests.rs`, `src/server/blocking_tests.rs`: transport/failure and real-socket blocking checks.
 - `src/main.rs`: arguments, two-worker Tokio entry point, signals, diagnostics.
 - `tests/cli.rs`, `tests/transport.rs`, `tests/databases.rs`: process/socket checks.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
@@ -264,10 +306,10 @@ retry. An owner panic/channel failure stops serving rather than replacing state;
 an explicit restart loses all data. This is not exactly-once delivery, persistence,
 or crash recovery.
 
-### Blocking-pop owner contract (TCP integration pending)
+### Blocking-pop contract
 
-The internal BLPOP/BRPOP operations accept **one to five key arguments** and a
-double-precision timeout in seconds. Duplicate keys count toward five, but are
+BLPOP/BRPOP accept **one to five key arguments** and a double-precision timeout
+in seconds. Duplicate keys count toward five, but are
 registered once in their original priority order. Both directions scan keys
 left to right: an earlier nonempty list wins over a later wrong type; an earlier
 wrong type fails without consuming from a later list. BLPOP removes the head,
@@ -315,19 +357,27 @@ adds logarithmic costs in pending waiters, plus eligible rechecks and byte costs
 No polling or task per timeout is needed. Empty rechecks preserve FIFO position
 and deadline; terminal cleanup removes indexes rather than leaving tombstones.
 
-**Current boundary:** TCP BLPOP/BRPOP attempts return an explicit `ERR` without
-accessing lists. Dropped internal reply receivers cannot consume on a later
-recheck, but prompt cancellation notification is not implemented: a canceled
-registration can remain until readiness, expiry, or owner shutdown. Socket EOF,
-blocking reply delivery, cancellation races, and bounded pending-connection
-shutdown must be integrated/tested before TCP exposure. Closing the owner work
-channel already drops all pending waits, including indefinite ones. A reply lost
-after removal never restores/requeues an item.
+Socket EOF, read failure, queued-input overflow, or task cancellation drops the
+pending execution future. Its guard first closes the reply receiver, then wakes
+the owner through a coalescing notification. The owner removes closed waits and
+all their key/deadline indexes even with no producer or finite timer. Cancellation
+sweeps are O(W) in pending waiters (at most 256 TCP clients); ordinary readiness
+still uses per-key indexes. Notifications contain no payload queue and create
+no per-waiter task. Cleanup runs between atomic units, never interrupts one.
+
+Before admission/owner execution, cancellation can skip the operation entirely.
+Racing a pop/producer may instead lose an already-committed response. The owner
+checks receiver closure before eligibility/removal, but no check can promise
+that a client stays alive through delivery. A reply lost after removal **never
+restores/requeues** the item; clients must not automatically retry ambiguous
+mutations. This is not a reliable work queue or exactly-once processing. Closing
+the last work sender also drops all pending waits, including indefinite ones;
+normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: expose BLPOP/BRPOP with verified socket cancellation and lifecycle cleanup.
-Blocking-socket concurrency and actual atomic-batch integration remain unverified.
+Next: complete ordered-pipeline and actual Redis-client startup/multiplexing
+verification. Actual atomic-batch integration remains unimplemented/unverified.
 
 Later work includes ordered pipelining, audited extra commands, genuine Lua 5.1,
 and MULTI/EXEC/DISCARD for an **unmodified** external crawler. Crawler sources and

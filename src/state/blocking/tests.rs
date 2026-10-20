@@ -648,8 +648,12 @@ async fn fence(client: &Client) {
 #[tokio::test(start_paused = true)]
 async fn owner_timer_driver_expires_without_other_work_and_retains_indefinite_waits() {
     let (work, receive) = mpsc::channel(WORK_CAPACITY);
-    let client = Client { work };
-    let owner = tokio::spawn(Owner::default().run(receive));
+    let canceled = Arc::new(Notify::new());
+    let client = Client {
+        work,
+        canceled: canceled.clone(),
+    };
+    let owner = tokio::spawn(Owner::default().run(receive, canceled));
     let mut finite = enqueue(&client, pop(ListEnd::Left, &[b"k"], b"0.0011")).await;
     let mut indefinite = enqueue(&client, pop(ListEnd::Right, &[b"forever"], b"-0")).await;
     fence(&client).await;
@@ -682,8 +686,12 @@ async fn owner_timer_driver_expires_without_other_work_and_retains_indefinite_wa
 #[tokio::test(start_paused = true)]
 async fn new_earliest_timer_rearms_and_popped_deadlines_do_not_fire_again() {
     let (work, receive) = mpsc::channel(WORK_CAPACITY);
-    let client = Client { work };
-    let owner = tokio::spawn(Owner::default().run(receive));
+    let canceled = Arc::new(Notify::new());
+    let client = Client {
+        work,
+        canceled: canceled.clone(),
+    };
+    let owner = tokio::spawn(Owner::default().run(receive, canceled));
     let mut long = enqueue(&client, pop(ListEnd::Left, &[b"long"], b"10")).await;
     fence(&client).await;
     advance(Duration::from_secs(1)).await;
@@ -773,6 +781,66 @@ async fn dedicated_owner_finite_timeout_uses_a_real_monotonic_deadline() {
         Reply::Array(None)
     );
     assert!(start.elapsed() >= Duration::from_millis(2));
+    drop(client);
+    timeout(LIMIT, done).await.unwrap().unwrap().unwrap();
+}
+
+#[test]
+fn cancellation_sweep_removes_every_key_and_deadline_index() {
+    let mut owner = Owner::default();
+    let now = Instant::now();
+    let mut canceled = Vec::new();
+    for timeout in [&b"0"[..], b"5.5"] {
+        for keys in [
+            vec![&b"a"[..], b"b", b"c", b"d", b"e"],
+            vec![&b"a"[..], b"a", b"a", b"a", b"a"],
+        ] {
+            canceled.push(send(
+                &mut owner,
+                DB,
+                pop(ListEnd::Left, &keys, timeout),
+                now,
+            ));
+        }
+    }
+    let mut live = send(
+        &mut owner,
+        DatabaseIndex(15),
+        pop(ListEnd::Right, &[b"other"], b"3"),
+        now,
+    );
+    drop(canceled);
+    owner.reap_closed();
+    assert_eq!(owner.waiters.len(), 1);
+    assert_eq!(owner.deadlines.len(), 1);
+    assert!(owner.watching[0].is_empty());
+    pending(&mut live);
+    drop(live);
+    owner.reap_closed();
+    empty_indexes(&owner);
+    owner.reap_closed(); // Repeated notifications are harmless.
+    owner.expire(now + Duration::from_secs(100));
+    empty_indexes(&owner);
+}
+
+#[tokio::test]
+async fn dropping_execute_notifies_a_dormant_owner_without_any_further_work() {
+    let (client, done, mut count) = crate::state::observed().unwrap();
+    for timeout_text in [&b"0"[..], b"1000"] {
+        let mut execution = Box::pin(client.execute(
+            DB,
+            pop(ListEnd::Left, &[b"a", b"b", b"c", b"d", b"e"], timeout_text),
+        ));
+        tokio::select! {
+            result = &mut execution => panic!("unexpected completion: {result:?}"),
+            observed = timeout(LIMIT, count.wait_for(|&n| n == 1)) => { observed.unwrap().unwrap(); }
+        }
+        drop(execution);
+        timeout(LIMIT, count.wait_for(|&n| n == 0))
+            .await
+            .unwrap()
+            .unwrap();
+    }
     drop(client);
     timeout(LIMIT, done).await.unwrap().unwrap().unwrap();
 }

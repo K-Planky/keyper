@@ -3,9 +3,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::thread;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::command::{DatabaseCommand, ListEnd};
 use crate::resp::Reply;
@@ -103,6 +104,24 @@ struct Work {
 #[derive(Clone)]
 pub(crate) struct Client {
     work: mpsc::Sender<Work>,
+    canceled: Arc<Notify>,
+}
+
+// Cancellation closes the reply first, then wakes the owner. Notify coalesces
+// bursts without an unbounded cleanup queue or a task per pending request.
+struct PendingReply {
+    receive: oneshot::Receiver<Reply>,
+    canceled: Arc<Notify>,
+    completed: bool,
+}
+
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.receive.close();
+            self.canceled.notify_one();
+        }
+    }
 }
 
 impl Client {
@@ -112,6 +131,11 @@ impl Client {
         command: DatabaseCommand,
     ) -> io::Result<Reply> {
         let (reply, receive) = oneshot::channel();
+        let mut pending = PendingReply {
+            receive,
+            canceled: self.canceled.clone(),
+            completed: false,
+        };
         self.work
             .send(Work {
                 database,
@@ -120,9 +144,9 @@ impl Client {
             })
             .await
             .map_err(|_| io::Error::other("state owner work channel closed"))?;
-        receive
-            .await
-            .map_err(|_| io::Error::other("state owner reply channel closed"))
+        let result = (&mut pending.receive).await;
+        pending.completed = true;
+        result.map_err(|_| io::Error::other("state owner reply channel closed"))
     }
 }
 
@@ -133,37 +157,52 @@ pub(crate) fn spawn() -> io::Result<(Client, Completion)> {
 }
 
 fn spawn_with(
-    run: impl FnOnce(mpsc::Receiver<Work>) -> io::Result<()> + Send + 'static,
+    run: impl FnOnce(mpsc::Receiver<Work>, Arc<Notify>) -> io::Result<()> + Send + 'static,
 ) -> io::Result<(Client, Completion)> {
     let (work, receive) = mpsc::channel(WORK_CAPACITY);
+    let canceled = Arc::new(Notify::new());
+    let owner_canceled = canceled.clone();
     let (finished, completion) = oneshot::channel();
     thread::Builder::new()
         .name("keyper-state".into())
         .spawn(move || {
             // Report panic only to fail-stop supervision, never to reset state
             // or turn uncertain execution into a normal client error.
-            let outcome = catch_unwind(AssertUnwindSafe(|| run(receive))).unwrap_or_else(|_| {
-                Err(io::Error::other("state owner panicked; service must stop"))
-            });
+            let outcome = catch_unwind(AssertUnwindSafe(|| run(receive, owner_canceled)))
+                .unwrap_or_else(|_| {
+                    Err(io::Error::other("state owner panicked; service must stop"))
+                });
             let _ = finished.send(outcome);
         })
         .map_err(|error| io::Error::new(error.kind(), format!("start state owner: {error}")))?;
-    Ok((Client { work }, completion))
+    Ok((Client { work, canceled }, completion))
 }
 
-fn run(work: mpsc::Receiver<Work>) -> io::Result<()> {
+fn run(work: mpsc::Receiver<Work>, canceled: Arc<Notify>) -> io::Result<()> {
+    run_owner(work, canceled, Owner::default())
+}
+
+fn run_owner(work: mpsc::Receiver<Work>, canceled: Arc<Notify>, owner: Owner) -> io::Result<()> {
     // A timer driver on this same dedicated thread parks only between atomic
     // units. Synchronous state work (and later Lua) never runs on network workers.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
-    runtime.block_on(Owner::default().run(work));
+    runtime.block_on(owner.run(work, canceled));
     Ok(())
 }
 
 #[cfg(test)]
+pub(crate) fn observed() -> io::Result<(Client, Completion, tokio::sync::watch::Receiver<usize>)> {
+    let (count, observe) = tokio::sync::watch::channel(0);
+    let (client, completion) =
+        spawn_with(move |work, canceled| run_owner(work, canceled, Owner::observed(count)))?;
+    Ok((client, completion, observe))
+}
+
+#[cfg(test)]
 pub(crate) fn failing_owner(fail: oneshot::Receiver<()>) -> io::Result<(Client, Completion)> {
-    spawn_with(move |_work| {
+    spawn_with(move |_work, _canceled| {
         fail.blocking_recv().unwrap();
         panic!("injected owner failure");
     })
@@ -343,9 +382,9 @@ mod tests {
     #[tokio::test]
     async fn full_work_queue_backpressures_without_blocking_tokio() {
         let (release, gate) = oneshot::channel();
-        let (client, done) = spawn_with(move |work| {
+        let (client, done) = spawn_with(move |work, canceled| {
             gate.blocking_recv().unwrap();
-            run(work)
+            run(work, canceled)
         })
         .unwrap();
         let mut replies = vec![];
@@ -381,6 +420,68 @@ mod tests {
         drop(replies);
         drop(client);
         timeout(LIMIT, done).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_execute_before_admission_or_owner_start_never_mutates() {
+        for full_queue in [false, true] {
+            let (release, gate) = oneshot::channel();
+            let (client, done) = spawn_with(move |work, canceled| {
+                gate.blocking_recv().unwrap();
+                run(work, canceled)
+            })
+            .unwrap();
+            let mut replies = Vec::new();
+            if full_queue {
+                for _ in 0..WORK_CAPACITY {
+                    let (reply, receive) = oneshot::channel();
+                    client
+                        .work
+                        .try_send(Work {
+                            database: DatabaseIndex::default(),
+                            command: DatabaseCommand::Get(vec![]),
+                            reply,
+                        })
+                        .ok()
+                        .unwrap();
+                    replies.push(receive);
+                }
+            }
+            let mut execution = Box::pin(client.execute(
+                DatabaseIndex::default(),
+                DatabaseCommand::Set {
+                    key: b"canceled".to_vec(),
+                    value: b"must-not-apply".to_vec(),
+                },
+            ));
+            tokio::select! {
+                biased;
+                result = &mut execution => panic!("owner gate did not hold: {result:?}"),
+                _ = tokio::task::yield_now() => (),
+            }
+            assert_eq!(
+                client.work.capacity(),
+                if full_queue { 0 } else { WORK_CAPACITY - 1 }
+            );
+            drop(execution);
+            release.send(()).unwrap();
+            assert_eq!(
+                timeout(
+                    LIMIT,
+                    client.execute(
+                        DatabaseIndex::default(),
+                        DatabaseCommand::Get(b"canceled".to_vec())
+                    )
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                Reply::Bulk(None)
+            );
+            drop(replies);
+            drop(client);
+            timeout(LIMIT, done).await.unwrap().unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -429,7 +530,7 @@ mod tests {
         .unwrap();
         let (finished, done) = oneshot::channel();
         thread::spawn(move || {
-            run(receive).unwrap();
+            run(receive, Arc::new(Notify::new())).unwrap();
             finished.send(()).unwrap();
         });
         // GET is a fence after SET, but the SET reply is never read. Dropping

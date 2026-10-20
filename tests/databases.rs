@@ -75,36 +75,6 @@ fn bulk(value: &[u8]) -> Reply {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocking_pops_remain_explicitly_unavailable_until_socket_lifecycle_integration() {
-    let server = TestServer::start().await;
-    let mut client = Client::connect(&server).await;
-    client
-        .expect(&[b"RPUSH", b"k", b"a", b"b"], Reply::Integer(2))
-        .await;
-    for command in [b"BLPOP", b"BRPOP"] {
-        client
-            .expect(
-                &[command, b"k", b"0"],
-                Reply::Error(b"ERR blocking pops are not exposed over TCP yet".to_vec()),
-            )
-            .await;
-        client
-            .expect(
-                &[command, b"missing", b"0"],
-                Reply::Error(b"ERR blocking pops are not exposed over TCP yet".to_vec()),
-            )
-            .await;
-    }
-    client
-        .expect(&[b"RPUSH", b"k", b"c"], Reply::Integer(3))
-        .await;
-    client
-        .expect(&[b"PING"], Reply::Simple(b"PONG".to_vec()))
-        .await;
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_sixteen_namespaces_and_independent_default_sessions() {
     let server = TestServer::start().await;
     let mut clients = vec![];

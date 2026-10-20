@@ -14,9 +14,9 @@ Options:
   --port NUMBER  Loopback listening port (default: 6379; 0: OS-assigned)
   -h, --help     Print this help
 
-Serves RESP2 PING, SELECT, GET, SET, EXISTS on 127.0.0.1.
-SELECT is first-command-only; SET has no options. Press Ctrl-C to stop.
-Lists, transactions, Lua, and other Redis commands are not implemented yet.";
+Serves RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP on 127.0.0.1.
+SELECT is first-command-only; SET has no options; blocking pops accept 1–5 keys.
+Press Ctrl-C to stop. Transactions, Lua, and other Redis commands are not implemented yet.";
 
 async fn run(config: Config) -> io::Result<()> {
     let listener = server::bind(config).await.map_err(|error| {
