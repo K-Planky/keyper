@@ -2,12 +2,14 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use keyper::resp::Reply;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 
 use support::{TestServer, bounded};
 
@@ -151,6 +153,8 @@ async fn selection_is_first_complete_attempt_only_and_errors_leave_database_unch
         vec![b"GET"],
         vec![b"SET", b"key"],
         vec![b"EXISTS"],
+        vec![b"LPUSH", b"key"],
+        vec![b"RPUSH", b"key", b"value"],
     ] {
         let mut client = Client::connect(&server).await;
         client.command(&first).await;
@@ -335,5 +339,237 @@ async fn stalled_database_reply_does_not_retain_state_and_restart_is_empty() {
     let server = TestServer::start().await;
     let mut fresh = Client::connect(&server).await;
     fresh.expect(&[b"GET", b"large"], Reply::Bulk(None)).await;
+    server.stop().await;
+}
+
+fn wrong_type() -> Reply {
+    Reply::Error(b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pushes_are_binary_safe_and_type_or_arity_errors_preserve_values() {
+    let server = TestServer::start().await;
+    let mut client = Client::connect(&server).await;
+    for key in [&b""[..], b"\0\xff\r\n"] {
+        client.expect(&[b"EXISTS", key], Reply::Integer(0)).await;
+        client
+            .expect(&[b"lPuSh", key, b"", b"\0\xff", b""], Reply::Integer(3))
+            .await;
+        client
+            .expect(&[b"rPuSh", key, b"c", b"d"], Reply::Integer(5))
+            .await;
+        client.expect(&[b"GET", key], wrong_type()).await;
+        client
+            .expect(&[b"EXISTS", key, b"absent", key], Reply::Integer(2))
+            .await;
+        for name in [&b"LPUSH"[..], b"RPUSH"] {
+            let error = Reply::Error(
+                format!(
+                    "ERR wrong number of arguments for '{}' command",
+                    std::str::from_utf8(name).unwrap().to_ascii_lowercase()
+                )
+                .into_bytes(),
+            );
+            // Admission fails before a list is created or an old one is touched.
+            client.expect(&[name], error).await;
+            assert!(matches!(
+                client.command(&[name, key]).await,
+                Reply::Error(_)
+            ));
+            client
+                .expect(&[b"EXISTS", b"absent"], Reply::Integer(0))
+                .await;
+            assert!(matches!(
+                client.command(&[name, b"absent"]).await,
+                Reply::Error(_)
+            ));
+            client
+                .expect(&[b"EXISTS", b"absent"], Reply::Integer(0))
+                .await;
+        }
+        assert!(matches!(
+            client.command(&[b"SET", key, b"bad", b"NX"]).await,
+            Reply::Error(_)
+        ));
+        client.expect(&[b"GET", key], wrong_type()).await;
+        client
+            .expect(&[b"RPUSH", key, b"still-a-list"], Reply::Integer(6))
+            .await;
+        for value in [&b""[..], b"replacement\0\xff"] {
+            client.expect(&[b"SET", key, value], ok()).await;
+            client.expect(&[b"GET", key], bulk(value)).await;
+            for name in [&b"LPUSH"[..], b"RPUSH"] {
+                client.expect(&[name, key, b"a", b"b"], wrong_type()).await;
+                client.expect(&[b"GET", key], bulk(value)).await;
+            }
+        }
+    }
+    // All 1022 values allowed by the request argument limit are inserted once.
+    let mut args = vec![&b"RPUSH"[..], b"many"];
+    args.extend(std::iter::repeat_n(
+        &b""[..],
+        keyper::resp::MAX_ARGUMENTS - 2,
+    ));
+    client.expect(&args, Reply::Integer(1022)).await;
+    args[0] = b"LPUSH";
+    client.expect(&args, Reply::Integer(2044)).await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lists_in_all_sixteen_databases_have_independent_types_and_lengths() {
+    let server = TestServer::start().await;
+    let mut clients = vec![];
+    for index in 0..16 {
+        let mut client = Client::connect(&server).await;
+        client
+            .expect(&[b"SELECT", index.to_string().as_bytes()], ok())
+            .await;
+        let mut args = vec![&b"RPUSH"[..], b"shared"];
+        args.extend(std::iter::repeat_n(&b"item"[..], index + 1));
+        client.expect(&args, Reply::Integer(index as i64 + 1)).await;
+        clients.push(client);
+    }
+    for (index, client) in clients.iter_mut().enumerate() {
+        client
+            .expect(
+                &[b"LPUSH", b"shared", b"front"],
+                Reply::Integer(index as i64 + 2),
+            )
+            .await;
+    }
+    let mut default = Client::connect(&server).await;
+    default
+        .expect(&[b"RPUSH", b"shared", b"default"], Reply::Integer(3))
+        .await;
+    default
+        .expect(&[b"SET", b"shared", b"now-string"], ok())
+        .await;
+    clients[0]
+        .expect(&[b"GET", b"shared"], bulk(b"now-string"))
+        .await;
+    clients[15].expect(&[b"GET", b"shared"], wrong_type()).await;
+    clients[15]
+        .expect(&[b"RPUSH", b"shared", b"last"], Reply::Integer(18))
+        .await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_variadic_pushes_return_whole_batch_lengths_without_lost_updates() {
+    const WRITERS: usize = 8;
+    const ROUNDS: usize = 32;
+    let server = TestServer::start().await;
+    let gate = Arc::new(Barrier::new(WRITERS));
+    let mut tasks = JoinSet::new();
+    for writer in 0..WRITERS {
+        let mut client = Client::connect(&server).await;
+        let gate = gate.clone();
+        tasks.spawn(async move {
+            let mut replies = vec![];
+            let name = if writer % 2 == 0 {
+                &b"LPUSH"[..]
+            } else {
+                b"RPUSH"
+            };
+            let identity = writer.to_string();
+            for round in 0..ROUNDS {
+                let key = format!("round-{round}");
+                gate.wait().await;
+                replies.push(
+                    client
+                        .command(&[name, key.as_bytes(), identity.as_bytes(), b"", b"\0\xff"])
+                        .await,
+                );
+            }
+            replies
+        });
+    }
+    let mut lengths: Vec<Vec<i64>> = (0..ROUNDS).map(|_| vec![]).collect();
+    bounded(async {
+        while let Some(result) = tasks.join_next().await {
+            for (round, reply) in result.unwrap().into_iter().enumerate() {
+                let Reply::Integer(length) = reply else {
+                    panic!("push returned {reply:?}");
+                };
+                lengths[round].push(length);
+            }
+        }
+    })
+    .await;
+    let mut observer = Client::connect(&server).await;
+    for (round, lengths) in lengths.iter_mut().enumerate() {
+        lengths.sort_unstable();
+        assert_eq!(
+            *lengths,
+            (1..=WRITERS as i64).map(|n| n * 3).collect::<Vec<_>>()
+        );
+        // This invocation follows every writer response: real-time order fixes
+        // the complete list length, regardless of the overlapping push order.
+        observer
+            .expect(
+                &[b"RPUSH", format!("round-{round}").as_bytes(), b"fence"],
+                Reply::Integer(WRITERS as i64 * 3 + 1),
+            )
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_set_and_push_have_only_valid_atomic_type_outcomes() {
+    let server = TestServer::start().await;
+    let mut setter = Client::connect(&server).await;
+    let mut pusher = Client::connect(&server).await;
+    let gate = Barrier::new(2);
+    for round in 0..32 {
+        let key = format!("race-{round}");
+        let setting = async {
+            gate.wait().await;
+            setter
+                .expect(&[b"SET", key.as_bytes(), b"string"], ok())
+                .await;
+        };
+        let pushing = async {
+            gate.wait().await;
+            pusher
+                .command(&[b"LPUSH", key.as_bytes(), b"a", b"b", b"c"])
+                .await
+        };
+        let ((), push) = bounded(async { tokio::join!(setting, pushing) }).await;
+        assert!(push == Reply::Integer(3) || push == wrong_type());
+        setter
+            .expect(&[b"GET", key.as_bytes()], bulk(b"string"))
+            .await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_variadic_pushes_never_create_or_partially_extend_a_list() {
+    let server = TestServer::start().await;
+    let mut observer = Client::connect(&server).await;
+    observer
+        .expect(&[b"RPUSH", b"existing", b"original"], Reply::Integer(1))
+        .await;
+    for (key, length) in [(&b"existing"[..], 1), (&b"absent"[..], 0)] {
+        for name in [&b"LPUSH"[..], b"RPUSH"] {
+            let mut partial = server.connect().await;
+            let wire = request(&[name, key, b"one", b"two"]);
+            bounded(partial.write_all(&wire[..wire.len() - 1]))
+                .await
+                .unwrap();
+            observer
+                .expect(&[b"EXISTS", key], Reply::Integer(i64::from(length > 0)))
+                .await;
+            bounded(partial.shutdown()).await.unwrap();
+            let mut reply = vec![];
+            bounded(partial.read_to_end(&mut reply)).await.unwrap();
+            assert!(reply.is_empty());
+        }
+        observer
+            .expect(&[b"RPUSH", key, b"fence"], Reply::Integer(length + 1))
+            .await;
+    }
     server.stop().await;
 }

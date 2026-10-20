@@ -1,13 +1,13 @@
 //! One dedicated thread owns all databases. No state reference crosses a channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::DatabaseCommand;
+use crate::command::{DatabaseCommand, ListEnd};
 use crate::resp::Reply;
 
 const DATABASES: usize = 16;
@@ -26,19 +26,32 @@ impl DatabaseIndex {
     }
 }
 
+enum Value {
+    String(Vec<u8>),
+    List(VecDeque<Vec<u8>>),
+}
+
 #[derive(Default)]
-struct Databases([HashMap<Vec<u8>, Vec<u8>>; DATABASES]);
+struct Databases([HashMap<Vec<u8>, Value>; DATABASES]);
+
+fn wrong_type() -> Reply {
+    Reply::Error(b"WRONGTYPE Operation against a key holding the wrong kind of value".to_vec())
+}
 
 impl Databases {
     fn execute(&mut self, database: DatabaseIndex, command: DatabaseCommand) -> Reply {
         let entries = &mut self.0[usize::from(database.0)];
         // This entire match is one non-interleaved operation: its lookup/insert
-        // (or full EXISTS scan) is the linearization point. Replies own bytes;
-        // sending/dropping one cannot retain or undo database access.
+        // (or full EXISTS scan / variadic push) is the linearization point.
+        // Replies own bytes; sending/dropping one cannot retain or undo access.
         match command {
-            DatabaseCommand::Get(key) => Reply::Bulk(entries.get(&key).cloned()),
+            DatabaseCommand::Get(key) => match entries.get(&key) {
+                None => Reply::Bulk(None),
+                Some(Value::String(value)) => Reply::Bulk(Some(value.clone())),
+                Some(Value::List(_)) => wrong_type(),
+            },
             DatabaseCommand::Set { key, value } => {
-                entries.insert(key, value);
+                entries.insert(key, Value::String(value));
                 Reply::Simple(b"OK".to_vec())
             }
             DatabaseCommand::Exists(keys) => Reply::Integer(
@@ -46,6 +59,25 @@ impl Databases {
                     .map(|key| i64::from(entries.contains_key(key)))
                     .sum(),
             ),
+            DatabaseCommand::Push { end, key, values } => {
+                let value = entries
+                    .entry(key)
+                    .or_insert_with(|| Value::List(VecDeque::new()));
+                let Value::List(list) = value else {
+                    return wrong_type();
+                };
+                // Complete every insertion and capture the resulting length as
+                // one atomic unit. Future waiter service must run only after it.
+                for value in values {
+                    match end {
+                        ListEnd::Left => list.push_front(value),
+                        ListEnd::Right => list.push_back(value),
+                    }
+                }
+                // VecDeque's nonzero-sized elements bound length below i64::MAX
+                // on supported 32/64-bit targets, before allocation can succeed.
+                Reply::Integer(list.len() as i64)
+            }
         }
     }
 }
@@ -172,6 +204,128 @@ mod tests {
             assert_eq!(
                 databases.execute(db, DatabaseCommand::Get(vec![])),
                 Reply::Bulk(Some(vec![]))
+            );
+        }
+    }
+
+    fn push(end: ListEnd, key: &[u8], values: &[&[u8]]) -> DatabaseCommand {
+        DatabaseCommand::Push {
+            end,
+            key: key.to_vec(),
+            values: values.iter().map(|value| value.to_vec()).collect(),
+        }
+    }
+
+    fn assert_list(databases: &Databases, db: DatabaseIndex, key: &[u8], expected: &[&[u8]]) {
+        let Some(Value::List(list)) = databases.0[usize::from(db.0)].get(key) else {
+            panic!("expected a stored list");
+        };
+        assert_eq!(list.iter().map(Vec::as_slice).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn pushes_create_lists_and_preserve_left_right_and_variadic_order() {
+        let mut databases = Databases::default();
+        let db = DatabaseIndex::default();
+        for (end, expected) in [
+            (ListEnd::Left, [&b"c"[..], b"b", b"a"]),
+            (ListEnd::Right, [&b"a"[..], b"b", b"c"]),
+        ] {
+            let key = match end {
+                ListEnd::Left => &b"left"[..],
+                ListEnd::Right => &b"right"[..],
+            };
+            assert_eq!(
+                databases.execute(db, push(end, key, &[b"a"])),
+                Reply::Integer(1)
+            );
+            assert_eq!(
+                databases.execute(db, push(end, key, &[b"b", b"c"])),
+                Reply::Integer(3)
+            );
+            assert_list(&databases, db, key, &expected);
+        }
+
+        let key = b"\0\xff\r\n";
+        assert_eq!(
+            databases.execute(db, push(ListEnd::Right, key, &[b"", b"\0\xff", b""])),
+            Reply::Integer(3)
+        );
+        assert_eq!(
+            databases.execute(db, push(ListEnd::Left, key, &[b"a", b"b"])),
+            Reply::Integer(5)
+        );
+        assert_eq!(
+            databases.execute(db, push(ListEnd::Right, key, &[b"c", b"d"])),
+            Reply::Integer(7)
+        );
+        assert_list(
+            &databases,
+            db,
+            key,
+            &[b"b", b"a", b"", b"\0\xff", b"", b"c", b"d"],
+        );
+    }
+
+    #[test]
+    fn wrong_types_do_not_mutate_and_set_replaces_lists_with_strings() {
+        let mut databases = Databases::default();
+        let db = DatabaseIndex::default();
+        for value in [&b""[..], b"\0\xff\r\n"] {
+            databases.execute(
+                db,
+                DatabaseCommand::Set {
+                    key: vec![],
+                    value: value.to_vec(),
+                },
+            );
+            for end in [ListEnd::Left, ListEnd::Right] {
+                assert_eq!(
+                    databases.execute(db, push(end, b"", &[b"a", b"b"])),
+                    wrong_type()
+                );
+                assert_eq!(
+                    databases.execute(db, DatabaseCommand::Get(vec![])),
+                    Reply::Bulk(Some(value.to_vec()))
+                );
+            }
+        }
+        databases.execute(db, push(ListEnd::Right, b"list", &[b"a", b"b"]));
+        assert_eq!(
+            databases.execute(db, DatabaseCommand::Get(b"list".to_vec())),
+            wrong_type()
+        );
+        assert_list(&databases, db, b"list", &[b"a", b"b"]);
+        assert_eq!(
+            databases.execute(
+                db,
+                DatabaseCommand::Exists(vec![
+                    b"list".to_vec(),
+                    vec![],
+                    b"missing".to_vec(),
+                    b"list".to_vec()
+                ])
+            ),
+            Reply::Integer(3)
+        );
+        assert_eq!(
+            databases.execute(
+                db,
+                DatabaseCommand::Set {
+                    key: b"list".to_vec(),
+                    value: vec![]
+                }
+            ),
+            Reply::Simple(b"OK".to_vec())
+        );
+        assert_eq!(
+            databases.execute(db, DatabaseCommand::Get(b"list".to_vec())),
+            Reply::Bulk(Some(vec![]))
+        );
+        for end in [ListEnd::Left, ListEnd::Right] {
+            assert_eq!(
+                databases.execute(db, push(end, b"list", &[b"c"])),
+                wrong_type()
             );
         }
     }

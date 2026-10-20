@@ -2,10 +2,10 @@
 
 A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
-**Current boundary: RESP2, PING, SELECT, GET, bare SET, and EXISTS.** Sixteen
-in-memory databases are owned by one dedicated state thread, separate from
-asynchronous networking. Lists/blocking pops, transactions, Lua, and crawler
-interoperability are **not implemented yet**.
+**Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, and RPUSH.**
+Sixteen in-memory databases hold strings or lists and are owned by one dedicated
+state thread, separate from asynchronous networking. Blocking pops, transactions,
+Lua, and crawler interoperability are **not implemented yet**.
 
 ## Prerequisites and build
 
@@ -63,6 +63,17 @@ redis-cli -2 -h 127.0.0.1 -p 6380 -n 15 GET greeting
 # "independent"
 redis-cli -2 -h 127.0.0.1 -p 6380 GET greeting
 # "hello"
+redis-cli -2 -h 127.0.0.1 -p 6380 LPUSH queue a b
+# (integer) 2
+redis-cli -2 -h 127.0.0.1 -p 6380 RPUSH queue c d
+# (integer) 4
+# The list is now [b, a, c, d]; list pop/read commands are not implemented yet.
+redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
+# (error) WRONGTYPE Operation against a key holding the wrong kind of value
+redis-cli -2 -h 127.0.0.1 -p 6380 SET queue replaced
+# OK
+redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
+# "replaced"
 ```
 
 Each invocation opens a new connection. `-n 15` selects database 15 at startup;
@@ -109,17 +120,23 @@ persistence; every explicit restart starts empty.
 | `PING` | Simple string `PONG` |
 | `PING message` | Bulk string containing the exact message, including empty/binary bytes |
 | `SELECT index` | Simple string `OK`; only the first complete command attempt, index 0–15 |
-| `GET key` | Bulk string value, or null bulk if absent |
-| `SET key value` | Simple string `OK`; overwrites the value; **no options** |
-| `EXISTS key [key ...]` | Integer count; repeated existing keys count repeatedly |
+| `GET key` | Bulk string value, null bulk if absent, or `WRONGTYPE` for a list |
+| `SET key value` | Simple string `OK`; overwrites any type with a string; **no options** |
+| `EXISTS key [key ...]` | Integer count for any type; repeated existing keys count repeatedly |
+| `LPUSH key value [value ...]` | Integer length after inserting all values at the head, in argument order |
+| `RPUSH key value [value ...]` | Integer length after inserting all values at the tail, in argument order |
 
 Command names are ASCII case-insensitive; keys/values are opaque bytes, including
 empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
 Indices use canonical decimal integer syntax (no `+`, whitespace, leading zeros,
 `-0`, or fractions). Invalid indices, wrong arity, SET options, empty command
 arrays, and unsupported commands return `ERR` replies without data mutation; the
-connection remains usable. GET's wrong-type behavior and SET's cross-type
-overwrite tests will arrive with list storage; currently only strings exist.
+connection remains usable. Pushes create a list when the key is absent, and
+return `WRONGTYPE` without changing an existing string. GET rejects lists without
+mutation; bare SET replaces a list with a string. LPUSH reverses its supplied
+values at the head (`LPUSH k a b c` yields `[c, b, a]`); RPUSH appends them
+(`RPUSH k a b c` yields `[a, b, c]`). Duplicates and empty/binary elements are
+retained. The entire variadic push, including its returned length, is atomic.
 PING is exempt from linearizability and excluded from operation histories.
 
 Requests must be arrays of **non-null bulk strings**. The decoder consumes one
@@ -180,9 +197,13 @@ external client. They cover configuration/CLI errors, all reply encodings,
 request limits, malformed/truncated frames, partial I/O, PING semantics,
 concurrent/slow/disconnected clients, occupied ports, and bounded shutdown.
 Database tests cover all sixteen namespaces, selection-window errors, binary
-values, rejected SET options, atomic repeated-key EXISTS, and concurrent SET/GET
-outcomes with cross-client real-time fences. Owner tests exercise asynchronous
-backpressure, cancellation/lost replies, and fail-stop panic supervision.
+values, rejected SET options, atomic repeated-key EXISTS, concurrent SET/GET
+outcomes with cross-client real-time fences, list creation/lengths in all sixteen
+databases, type errors, SET-over-list, incomplete pushes, and concurrent variadic
+push/SET outcomes. State tests inspect internal left/right list order and binary
+contents; public pop-based ordering checks arrive with blocking pops. Owner tests
+exercise asynchronous backpressure, cancellation/lost replies, and fail-stop
+panic supervision.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
@@ -203,12 +224,17 @@ certification of future blocking/batch behavior or crawler compatibility.
 ## Linearizability and failure contract
 
 Under the single-machine/correct-OS-and-hardware assumptions, the dedicated owner
-alone accesses the sixteen maps. Every GET, SET, or entire variadic EXISTS runs
-without interleaving. GET linearizes at its lookup, SET at insertion/replacement,
-and EXISTS during its indivisible scan; it never samples different moments for
-repeated arguments. SELECT linearizes at the connection-local state transition;
-input-validation errors linearize at validation without touching data. Other
-clients cannot change a connection's selected database. PING is not in histories.
+alone accesses the sixteen maps. Every GET, SET, entire variadic EXISTS, or entire
+LPUSH/RPUSH runs without interleaving. GET (including a type error) linearizes at
+its lookup, SET at insertion/replacement, and EXISTS during its indivisible scan;
+it never samples different moments for repeated arguments. A push linearizes
+after all insertions, when its resulting length is captured; a wrong-type push
+linearizes at the type check without mutation. No other operation can observe a
+partial push. Future waiter service must run after this complete unit and its
+reply capture, not between elements. SELECT linearizes at the connection-local
+state transition; input-validation errors linearize at validation without
+touching data. Other clients cannot change a connection's selected database.
+PING is not in histories.
 
 The owner receives owned commands and returns owned replies. A reply is created
 after the operation and before asynchronous socket writing. Thus a response
@@ -216,7 +242,10 @@ received before a later invocation fixes their state order; overlapping calls
 can take either valid order. No map reference or database ownership survives into
 network I/O. Hash-map lookup/insertion is average O(1); EXISTS is O(N) in supplied
 key arguments, as in the [Redis command reference](https://redis.io/docs/latest/commands/).
-Hashing/copying/serialization also costs the number of bytes involved. Databases
+Lists use `VecDeque`, with amortized O(1) insertion at either end and amortized
+O(N) for N inserted elements, without shifting the list on every LPUSH. No whole-database
+scan or copy is involved. Hashing/copying/serialization also costs the number of
+bytes involved; replacing a list additionally frees its old elements. Databases
 are isolated namespaces, not independently executing owner threads.
 
 A dropped reply receiver lets the owner skip an operation that has not begun.
@@ -228,8 +257,8 @@ or crash recovery.
 
 ## Remaining work (not implemented)
 
-Further core commands will be LPUSH, RPUSH, BLPOP, and BRPOP; blocking pops accept
-one to five keys and a double-precision timeout. The planned owner will atomically
+Remaining core commands are BLPOP and BRPOP; blocking pops accept one to five
+keys and a double-precision timeout. The planned owner will atomically
 check/register waits, then remain available to other clients. Waiters recheck
 keys left to right after complete atomic units, with FIFO priority and one
 terminal outcome each. No state ownership may span a blocking wait. Blocking

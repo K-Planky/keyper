@@ -3,11 +3,25 @@
 use crate::resp::{Reply, Request};
 use crate::state::DatabaseIndex;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListEnd {
+    Left,
+    Right,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DatabaseCommand {
     Get(Vec<u8>),
-    Set { key: Vec<u8>, value: Vec<u8> },
+    Set {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     Exists(Vec<Vec<u8>>),
+    Push {
+        end: ListEnd,
+        key: Vec<u8>,
+        values: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -102,6 +116,20 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity("exists"));
         }
         Ok(Command::Database(DatabaseCommand::Exists(args.collect())))
+    } else if name.eq_ignore_ascii_case(b"LPUSH") || name.eq_ignore_ascii_case(b"RPUSH") {
+        let (end, command) = if name.eq_ignore_ascii_case(b"LPUSH") {
+            (ListEnd::Left, "lpush")
+        } else {
+            (ListEnd::Right, "rpush")
+        };
+        if args.len() < 2 {
+            return Err(wrong_arity(command));
+        }
+        Ok(Command::Database(DatabaseCommand::Push {
+            end,
+            key: args.next().unwrap(),
+            values: args.collect(),
+        }))
     } else {
         // Never reflect arbitrary (possibly binary or sensitive) input.
         Err(Reply::Error(b"ERR unknown command".to_vec()))
@@ -159,8 +187,26 @@ mod tests {
             vec![b"SET", b"a"],
             vec![b"SET", b"a", b"v", b"NX"],
             vec![b"EXISTS"],
+            vec![b"LPUSH"],
+            vec![b"LPUSH", b"key"],
+            vec![b"RPUSH"],
+            vec![b"RPUSH", b"key"],
         ] {
             assert!(matches!(parse(request(&args)), Err(Reply::Error(_))));
+        }
+    }
+
+    #[test]
+    fn push_admission_preserves_end_key_and_all_binary_values() {
+        for (name, end) in [(b"lPuSh", ListEnd::Left), (b"rPuSh", ListEnd::Right)] {
+            assert_eq!(
+                parse(request(&[name, b"\0\xff", b"", b"a\r\n", b"a\r\n"])),
+                Ok(Command::Database(DatabaseCommand::Push {
+                    end,
+                    key: b"\0\xff".to_vec(),
+                    values: vec![vec![], b"a\r\n".to_vec(), b"a\r\n".to_vec()],
+                }))
+            );
         }
     }
 
