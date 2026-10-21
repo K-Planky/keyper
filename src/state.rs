@@ -12,8 +12,11 @@ use crate::command::{DatabaseCommand, ListEnd, parse_integer};
 use crate::resp::Reply;
 
 mod blocking;
+mod hash;
 mod set;
 
+#[cfg(test)]
+mod hashes_tests;
 #[cfg(test)]
 mod numeric_sets_tests;
 
@@ -39,6 +42,7 @@ enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
     Set(set::Set),
+    Hash(hash::Hash),
 }
 
 #[derive(Default)]
@@ -52,7 +56,7 @@ impl Databases {
     fn execute(&mut self, database: DatabaseIndex, command: DatabaseCommand) -> Reply {
         let entries = &mut self.0[usize::from(database.0)];
         // This entire match is one non-interleaved operation: its lookup/insert
-        // (or full variadic operation / member snapshot) is the linearization point.
+        // (or full variadic operation / collection snapshot) is the linearization point.
         // Replies own bytes; sending/dropping one cannot retain or undo access.
         match command {
             DatabaseCommand::Get(key) => match entries.get(&key) {
@@ -132,6 +136,76 @@ impl Databases {
                     set.members
                         .iter()
                         .map(|member| Reply::Bulk(Some(member.clone())))
+                        .collect(),
+                )),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::HashSet { key, pairs } => {
+                let value = entries
+                    .entry(key)
+                    .or_insert_with(|| Value::Hash(hash::Hash::default()));
+                let Value::Hash(hash) = value else {
+                    return wrong_type();
+                };
+                // Each first insertion counts once; repeated fields overwrite
+                // in argument order, so their final supplied value wins.
+                let added = pairs
+                    .into_iter()
+                    .map(|(field, value)| i64::from(hash.set(field, value)))
+                    .sum();
+                Reply::Integer(added)
+            }
+            DatabaseCommand::HashGet { key, field } => match entries.get(&key) {
+                None => Reply::Bulk(None),
+                Some(Value::Hash(hash)) => Reply::Bulk(hash.get(&field).cloned()),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::HashDelete { key, fields } => {
+                let hash = match entries.get_mut(&key) {
+                    None => return Reply::Integer(0),
+                    Some(Value::Hash(hash)) => hash,
+                    Some(_) => return wrong_type(),
+                };
+                let removed = fields
+                    .iter()
+                    .map(|field| i64::from(hash.remove(field)))
+                    .sum();
+                if hash.pairs.is_empty() {
+                    entries.remove(&key);
+                }
+                Reply::Integer(removed)
+            }
+            DatabaseCommand::HashContains { key, field } => match entries.get(&key) {
+                None => Reply::Integer(0),
+                Some(Value::Hash(hash)) => Reply::Integer(i64::from(hash.get(&field).is_some())),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::HashLength(key) => match entries.get(&key) {
+                None => Reply::Integer(0),
+                Some(Value::Hash(hash)) => Reply::Integer(hash.pairs.len() as i64),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::HashGetAll(key) => match entries.get(&key) {
+                None => Reply::Array(Some(vec![])),
+                Some(Value::Hash(hash)) => Reply::Array(Some(
+                    hash.pairs
+                        .iter()
+                        .flat_map(|(field, value)| {
+                            [
+                                Reply::Bulk(Some(field.clone())),
+                                Reply::Bulk(Some(value.clone())),
+                            ]
+                        })
+                        .collect(),
+                )),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::HashValues(key) => match entries.get(&key) {
+                None => Reply::Array(Some(vec![])),
+                Some(Value::Hash(hash)) => Reply::Array(Some(
+                    hash.pairs
+                        .iter()
+                        .map(|(_, value)| Reply::Bulk(Some(value.clone())))
                         .collect(),
                 )),
                 Some(_) => wrong_type(),

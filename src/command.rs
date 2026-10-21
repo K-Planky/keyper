@@ -32,6 +32,25 @@ pub(crate) enum DatabaseCommand {
     },
     SetCardinality(Vec<u8>),
     SetMembers(Vec<u8>),
+    HashSet {
+        key: Vec<u8>,
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    HashGet {
+        key: Vec<u8>,
+        field: Vec<u8>,
+    },
+    HashDelete {
+        key: Vec<u8>,
+        fields: Vec<Vec<u8>>,
+    },
+    HashContains {
+        key: Vec<u8>,
+        field: Vec<u8>,
+    },
+    HashLength(Vec<u8>),
+    HashGetAll(Vec<u8>),
+    HashValues(Vec<u8>),
     Push {
         end: ListEnd,
         key: Vec<u8>,
@@ -173,6 +192,56 @@ fn parse(request: Request) -> Result<Command, Reply> {
             DatabaseCommand::SetCardinality(key)
         } else {
             DatabaseCommand::SetMembers(key)
+        }))
+    } else if name.eq_ignore_ascii_case(b"HSET") {
+        if args.len() < 3 || args.len() % 2 != 1 {
+            return Err(wrong_arity("hset"));
+        }
+        let key = args.next().unwrap();
+        let mut pairs = Vec::with_capacity(args.len() / 2);
+        while let Some(field) = args.next() {
+            pairs.push((field, args.next().unwrap()));
+        }
+        Ok(Command::Database(DatabaseCommand::HashSet { key, pairs }))
+    } else if name.eq_ignore_ascii_case(b"HDEL") {
+        if args.len() < 2 {
+            return Err(wrong_arity("hdel"));
+        }
+        Ok(Command::Database(DatabaseCommand::HashDelete {
+            key: args.next().unwrap(),
+            fields: args.collect(),
+        }))
+    } else if name.eq_ignore_ascii_case(b"HGET") || name.eq_ignore_ascii_case(b"HEXISTS") {
+        let get = name.eq_ignore_ascii_case(b"HGET");
+        if args.len() != 2 {
+            return Err(wrong_arity(if get { "hget" } else { "hexists" }));
+        }
+        let key = args.next().unwrap();
+        let field = args.next().unwrap();
+        Ok(Command::Database(if get {
+            DatabaseCommand::HashGet { key, field }
+        } else {
+            DatabaseCommand::HashContains { key, field }
+        }))
+    } else if name.eq_ignore_ascii_case(b"HLEN")
+        || name.eq_ignore_ascii_case(b"HGETALL")
+        || name.eq_ignore_ascii_case(b"HVALS")
+    {
+        let command = if name.eq_ignore_ascii_case(b"HLEN") {
+            "hlen"
+        } else if name.eq_ignore_ascii_case(b"HGETALL") {
+            "hgetall"
+        } else {
+            "hvals"
+        };
+        if args.len() != 1 {
+            return Err(wrong_arity(command));
+        }
+        let key = args.next().unwrap();
+        Ok(Command::Database(match command {
+            "hlen" => DatabaseCommand::HashLength(key),
+            "hgetall" => DatabaseCommand::HashGetAll(key),
+            _ => DatabaseCommand::HashValues(key),
         }))
     } else if name.eq_ignore_ascii_case(b"LPUSH") || name.eq_ignore_ascii_case(b"RPUSH") {
         let (end, command) = if name.eq_ignore_ascii_case(b"LPUSH") {
@@ -360,6 +429,76 @@ mod tests {
             assert_eq!(parse_integer(bytes), None);
         }
         assert_eq!(parse_integer(&vec![b'1'; 8192]), None);
+    }
+
+    #[test]
+    fn hash_admission_checks_complete_pairs_and_preserves_binary_arguments() {
+        let key = b"\0\xff".to_vec();
+        for (args, command) in [
+            (
+                vec![&b"hSeT"[..], &key, b"", b"\0\xff\r\n", b"", b"last"],
+                DatabaseCommand::HashSet {
+                    key: key.clone(),
+                    pairs: vec![(vec![], b"\0\xff\r\n".to_vec()), (vec![], b"last".to_vec())],
+                },
+            ),
+            (
+                vec![b"hDeL", &key, b"", b""],
+                DatabaseCommand::HashDelete {
+                    key: key.clone(),
+                    fields: vec![vec![], vec![]],
+                },
+            ),
+            (
+                vec![b"hGeT", &key, b""],
+                DatabaseCommand::HashGet {
+                    key: key.clone(),
+                    field: vec![],
+                },
+            ),
+            (
+                vec![b"hExIsTs", &key, b""],
+                DatabaseCommand::HashContains {
+                    key: key.clone(),
+                    field: vec![],
+                },
+            ),
+            (
+                vec![b"hLeN", &key],
+                DatabaseCommand::HashLength(key.clone()),
+            ),
+            (
+                vec![b"hGeTaLl", &key],
+                DatabaseCommand::HashGetAll(key.clone()),
+            ),
+            (
+                vec![b"hVaLs", &key],
+                DatabaseCommand::HashValues(key.clone()),
+            ),
+        ] {
+            assert_eq!(parse(request(&args)), Ok(Command::Database(command)));
+        }
+        for name in [
+            &b"HSET"[..],
+            b"HDEL",
+            b"HGET",
+            b"HEXISTS",
+            b"HLEN",
+            b"HGETALL",
+            b"HVALS",
+        ] {
+            for count in 0..8 {
+                let valid = match name {
+                    b"HSET" => count >= 3 && count % 2 == 1,
+                    b"HDEL" => count >= 2,
+                    b"HGET" | b"HEXISTS" => count == 2,
+                    _ => count == 1,
+                };
+                let mut args = vec![name];
+                args.extend(vec![&b""[..]; count]);
+                assert_eq!(parse(request(&args)).is_ok(), valid, "{name:?}, {count}");
+            }
+        }
     }
 
     #[test]

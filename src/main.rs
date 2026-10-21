@@ -15,7 +15,8 @@ Options:
   -h, --help     Print this help
 
 Serves RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,
-INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS on 127.0.0.1.
+INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
+HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS on 127.0.0.1.
 SELECT is first-command-only; SET has no options; blocking pops accept 1–5 keys.
 Press Ctrl-C to stop. Transactions, Lua, and other Redis commands are not implemented yet.";
 

@@ -115,12 +115,13 @@ def corpus():
     yield [b"INCR", b"set"]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def compare(corpus_factory, normalize, description):
+    """Shared owned-endpoint runner for the numeric/set and hash corpora."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--keyper", default="target/debug/keyper")
     parser.add_argument("--redis-server", required=True)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="keyper-numeric-reference-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="keyper-command-reference-") as scratch:
         # Redis uses an owned Unix socket, with TCP/persistence disabled. Keyper
         # binds its own OS-assigned loopback port. No existing server is touched.
         redis_socket = str(pathlib.Path(scratch) / "redis.sock")
@@ -163,17 +164,22 @@ def main():
             sockets = [keyper_sock, redis_sock]
             streams = [stack.enter_context(sock.makefile("rb")) for sock in sockets]
             count = 0
-            for args in corpus():
+            for args in corpus_factory():
                 replies = [
-                    command(sock, stream, args)
+                    normalize(args, command(sock, stream, args))
                     for sock, stream in zip(sockets, streams)
                 ]
-                if args[0].upper() == b"SMEMBERS" and replies[0][0] == replies[1][0] == b"*":
-                    replies = [(kind, sorted(members)) for kind, members in replies]
                 assert replies[0] == replies[1], f"comparison {count}, command {args[0]!r}: {replies!r}"
                 count += 1
-    print(f"PASS: {count} commands match reference Redis (unordered SMEMBERS normalized)")
+    print(f"PASS: {count} commands match reference Redis (only unordered collections normalized)")
+
+
+def normalize(args, reply):
+    kind, value = reply
+    if args[0].upper() == b"SMEMBERS" and kind == b"*":
+        return kind, sorted(value)
+    return reply
 
 
 if __name__ == "__main__":
-    main()
+    compare(corpus, normalize, __doc__)

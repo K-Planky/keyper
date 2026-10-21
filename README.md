@@ -3,8 +3,9 @@
 A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
-BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, and SMEMBERS.**
-Sixteen in-memory databases hold strings, lists, or sets and belong to one
+BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
+HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, and HVALS.**
+Sixteen in-memory databases hold strings, lists, sets, or hashes and belong to one
 dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
 Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
@@ -99,6 +100,20 @@ redis-cli -2 -h 127.0.0.1 -p 6380 SMEMBERS seen
 # "page-a" and "page-b", in unspecified order
 redis-cli -2 -h 127.0.0.1 -p 6380 SREM seen page-a page-a missing
 # (integer) 1
+redis-cli -2 -h 127.0.0.1 -p 6380 HSET record state running processed 0 state done
+# (integer) 2; repeated fields count once, and the last value wins
+redis-cli -2 -h 127.0.0.1 -p 6380 HGET record state
+# "done"
+redis-cli -2 -h 127.0.0.1 -p 6380 HEXISTS record processed
+# (integer) 1
+redis-cli -2 -h 127.0.0.1 -p 6380 HLEN record
+# (integer) 2
+redis-cli -2 -h 127.0.0.1 -p 6380 HGETALL record
+# Alternating field/value strings: state, done, processed, 0 (pair order unspecified)
+redis-cli -2 -h 127.0.0.1 -p 6380 HVALS record
+# "done" and "0", in unspecified order
+redis-cli -2 -h 127.0.0.1 -p 6380 HDEL record processed processed missing
+# (integer) 1
 ```
 
 To demonstrate blocking, run this in another terminal:
@@ -178,6 +193,13 @@ persistence; every explicit restart starts empty.
 | `SISMEMBER key member` | Integer 1 if present, otherwise 0 (including absent key) |
 | `SCARD key` | Integer member count, or 0 for absent key |
 | `SMEMBERS key` | Unordered array of bulk-string members; empty array for absent key |
+| `HSET key field value [field value ...]` | Integer count of new fields; existing fields are overwritten; last repeated value wins |
+| `HGET key field` | Bulk string value; null bulk for an absent field/key |
+| `HDEL key field [field ...]` | Integer count of removed fields; repeated fields count once; deletes an emptied hash key |
+| `HEXISTS key field` | Integer 1 if the field exists (even with an empty value), otherwise 0 |
+| `HLEN key` | Integer field count, or 0 for an absent key |
+| `HGETALL key` | Flat array of alternating bulk-string fields/values; empty array for an absent key; pair order unspecified |
+| `HVALS key` | Unordered bulk-string value array, retaining duplicates; empty array for an absent key |
 
 Command names are ASCII case-insensitive; keys/values are opaque bytes, including
 empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
@@ -220,6 +242,17 @@ apply their whole variadic operation before any other command observes it;
 SMEMBERS is a single atomic snapshot, not ordered output. SET can replace a set
 with a string; EXISTS counts any supported type. Set creation/deletion does not
 wake blocked list pops; subsequent list activity still rechecks key/type priority.
+
+Hash commands likewise reject non-hash types without mutation. HSET creates a
+hash only after all field/value pairs pass arity validation; an unmatched field
+returns an error without applying even the valid prefix. HGET distinguishes a
+missing field (null) from a present empty value. Fields and values are opaque
+bytes; decimal counters are never converted to numbers by hash storage. HSET
+and HDEL apply their whole argument list atomically. Each HGETALL or HVALS is
+one indivisible snapshot of that hash, not several independent field reads.
+**Separate commands, even pipelined, are not a coherent multi-key snapshot**;
+the crawler's transaction boundary remains future work. SET replaces hashes;
+EXISTS counts them; hash creation/deletion does not wake blocked list pops.
 
 ### Resource limits and ordering
 
@@ -358,6 +391,12 @@ Numeric/set tests cover signed boundaries and canonical parsing, exact IDs beyon
 duplicates, empty-set deletion/recreation, all sixteen databases, dense-index
 churn, waiter type priority, fragmented ordered replies, concurrent unique ID
 allocation/overflow, and atomic variadic deduplication/removal/member snapshots.
+Hash tests cover all seven commands, binary/empty/large fields and values,
+missing/null distinctions, duplicate and overwrite counts, duplicate HVALS,
+flat RESP2 pairs, arity/nonmutation, type interactions, all sixteen databases,
+last-field deletion/recreation, maximum variadic pairs, incomplete framing,
+index churn against an independent ordered map, waiter type rechecking, and
+concurrent whole-record creation/deletion/replacement with real-time fences.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
@@ -383,6 +422,23 @@ This opt-in check is separate from `cargo test` and is not a full Redis/crawler
 certification. Verified with Redis **7.4.0**; concurrent contracts are tested by
 the Rust suites, not this sequential comparison.
 
+### Optional hash reference comparison
+
+Using the same Python/Redis prerequisites and owned-endpoint policy:
+
+```sh
+cargo build --locked
+python3 tests/compare_hashes.py --redis-server /absolute/path/to/redis-server
+```
+
+Verified with Redis **7.4.0**: **3,101** commands including all hash arity/type
+errors, binary/empty fields and values, duplicate updates/deletes, exact decimal
+strings, and deterministic churn. Only HGETALL **pair** order and HVALS/SMEMBERS
+element order are normalized; duplicate values and field/value associations
+must remain intact. The script reuses the numeric/set harness's bounded process
+runner. Neither comparison substitutes for concurrent tests, future transactions,
+Lua, or a full crawler run; missing prerequisites or mismatches exit nonzero.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
@@ -391,6 +447,8 @@ the Rust suites, not this sequential comparison.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
 - `src/state/set.rs`: dense set members with a hash index for constant-time membership/removal.
 - `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
+- `src/state/hash.rs`: dense field/value pairs with a lookup index and unspecified ordering.
+- `src/state/hashes_tests.rs`: hash semantics, type interactions, and independent-map churn checks.
 - `src/state/blocking.rs`: pop eligibility, waiter indexes, owner loop, and deadlines.
 - `src/state/blocking/tests.rs`: deterministic owner-level blocking tests.
 - `src/server.rs`: loopback listener, ordered connection tasks, writes, supervision.
@@ -400,7 +458,9 @@ the Rust suites, not this sequential comparison.
 - `tests/cli.rs`, `tests/transport.rs`, `tests/databases.rs`: process/socket checks.
 - `tests/pipelining.rs`: raw pipelines and actual Redis 1.7.1 startup/multiplexing.
 - `tests/numeric_sets.rs`: numeric/set wire, boundary, and concurrent allocation/dedup tests.
-- `tests/compare_numeric_sets.py`: opt-in comparison with an owned reference Redis.
+- `tests/hashes.rs`: hash wire shapes, boundaries, and concurrent whole-record operations.
+- `tests/compare_numeric_sets.py`: opt-in numeric/set comparison and shared owned-endpoint runner.
+- `tests/compare_hashes.py`: opt-in hash comparison with an owned reference Redis.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -418,8 +478,13 @@ overflow, and wrong-type outcomes linearize at the indivisible check without
 mutation. Entire SADD/SREM operations (including empty-key removal) linearize
 after all arguments; SISMEMBER/SCARD at lookup, and SMEMBERS during its indivisible
 member snapshot. A concurrent deduplication race adds each member once, and
-successful increments allocate distinct exact IDs until signed overflow. These
-are individual operations, not a substitute for future script/EXEC atomicity.
+successful increments allocate distinct exact IDs until signed overflow.
+HSET/HDEL linearize after all fields, including last-field key deletion; HGET,
+HEXISTS, and HLEN at lookup; HGETALL/HVALS during their indivisible hash snapshot.
+Wrong-type outcomes linearize at the type check without mutation. A reader
+cannot observe a partially updated variadic record, but separate reads can see
+different moments. These are individual operations, not a substitute for future
+script/EXEC atomicity.
 SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
 touching data. Other clients cannot change a connection's selected database.
@@ -439,8 +504,12 @@ membership/cardinality/insert/remove, amortized O(N) for N SADD/SREM arguments,
 and O(current cardinality) SMEMBERS even after heavy removal (rather than scanning
 a sparse hash table's historical capacity). Swap-removal leaves member order
 unspecified. This direct layout stores each member's bytes twice; no additional
-dependency is needed. Hashing/copying/serialization also costs the number of
-bytes involved; replacing a collection additionally frees its old elements.
+dependency is needed. Hashes similarly use dense field/value pairs and a field
+index: average O(1) HGET/HEXISTS/HLEN and field insertion/update/removal, amortized
+O(N) HSET/HDEL for N supplied pairs/fields, and O(current field count)
+HGETALL/HVALS after churn. Hash fields are stored twice, values once; swap-removal
+leaves pair/value order unspecified. Hashing/copying/serialization also costs the
+number of bytes involved; replacing a collection additionally frees its old elements.
 Databases are isolated namespaces, not independently executing owner threads.
 
 A dropped reply receiver lets the owner skip an operation that has not begun.
@@ -520,7 +589,7 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: the audited hash commands, followed by the remaining list/key commands.
+Next: the remaining audited list/key commands (TYPE, LLEN, LINDEX, LPOP).
 Actual atomic-batch integration remains unimplemented/unverified.
 
 Later work includes genuine Lua 5.1 and MULTI/EXEC/DISCARD for an **unmodified**

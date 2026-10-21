@@ -64,6 +64,72 @@ fn empty_indexes(owner: &Owner) {
 }
 
 #[test]
+fn hash_creation_and_deletion_do_not_wake_waiters_but_later_list_activity_rechecks_types() {
+    let now = Instant::now();
+    let mut owner = Owner::default();
+    let mut waiting = send(
+        &mut owner,
+        DB,
+        pop(ListEnd::Left, &[b"h", b"ready"], b"0"),
+        now,
+    );
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            DatabaseCommand::HashSet {
+                key: b"h".to_vec(),
+                pairs: vec![(b"f".to_vec(), b"v".to_vec())],
+            },
+            now
+        ),
+        Reply::Integer(1)
+    );
+    pending(&mut waiting);
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            DatabaseCommand::HashDelete {
+                key: b"h".to_vec(),
+                fields: vec![b"f".to_vec()],
+            },
+            now
+        ),
+        Reply::Integer(1)
+    );
+    pending(&mut waiting);
+    execute(
+        &mut owner,
+        DB,
+        DatabaseCommand::HashSet {
+            key: b"h".to_vec(),
+            pairs: vec![(b"f".to_vec(), b"v".to_vec())],
+        },
+        now,
+    );
+    pending(&mut waiting);
+    execute(
+        &mut owner,
+        DB,
+        push(ListEnd::Right, b"ready", &[b"item"]),
+        now,
+    );
+    assert_eq!(waiting.try_recv(), Ok(wrong_type()));
+    empty_indexes(&owner);
+    // The later ready list was not consumed past the earlier wrong-type hash.
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            pop(ListEnd::Left, &[b"ready", b"h"], b"0"),
+            now
+        ),
+        pair(b"ready", b"item")
+    );
+}
+
+#[test]
 fn double_timeouts_are_checked_and_positive_fractions_round_up() {
     let now = Instant::now();
     for text in ["0", "-0", "+0", "0.000", "-0.0e-9999", "0e9999"] {

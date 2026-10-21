@@ -56,7 +56,7 @@ fn help_succeeds_and_describes_the_actual_boundary() {
     assert!(help.contains("default: 6379"));
     assert!(
         help.contains(
-            "RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,\nINCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS on 127.0.0.1"
+            "RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,\nINCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,\nHSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS on 127.0.0.1"
         )
     );
     assert!(help.contains("SELECT is first-command-only; SET has no options"));
