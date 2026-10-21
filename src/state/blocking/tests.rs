@@ -823,6 +823,88 @@ fn cancellation_sweep_removes_every_key_and_deadline_index() {
     empty_indexes(&owner);
 }
 
+#[test]
+fn set_creation_and_empty_deletion_do_not_wake_waiters_but_list_readiness_does() {
+    let mut owner = Owner::default();
+    let now = Instant::now();
+    let mut waiting = send(
+        &mut owner,
+        DB,
+        pop(ListEnd::Left, &[b"set", b"list"], b"0"),
+        now,
+    );
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            DatabaseCommand::SetAdd {
+                key: b"set".to_vec(),
+                members: vec![b"member".to_vec()]
+            },
+            now
+        ),
+        Reply::Integer(1)
+    );
+    pending(&mut waiting);
+    // List activity makes the waiter recheck its keys; the earlier set is a
+    // wrong type, not a usable list, and the pushed item must remain untouched.
+    assert_eq!(
+        execute(&mut owner, DB, push(ListEnd::Right, b"list", &[b"v"]), now),
+        Reply::Integer(1)
+    );
+    assert_eq!(waiting.try_recv().unwrap(), wrong_type());
+    empty_indexes(&owner);
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            pop(ListEnd::Right, &[b"list", b"set"], b"0"),
+            now
+        ),
+        pair(b"list", b"v")
+    );
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            DatabaseCommand::SetRemove {
+                key: b"set".to_vec(),
+                members: vec![b"member".to_vec()]
+            },
+            now
+        ),
+        Reply::Integer(1)
+    );
+    let mut waiting = send(&mut owner, DB, pop(ListEnd::Right, &[b"set"], b"0"), now);
+    execute(
+        &mut owner,
+        DB,
+        DatabaseCommand::SetAdd {
+            key: b"set".to_vec(),
+            members: vec![b"member".to_vec()],
+        },
+        now,
+    );
+    execute(
+        &mut owner,
+        DB,
+        DatabaseCommand::SetRemove {
+            key: b"set".to_vec(),
+            members: vec![b"member".to_vec()],
+        },
+        now,
+    );
+    pending(&mut waiting);
+    execute(
+        &mut owner,
+        DB,
+        push(ListEnd::Right, b"set", &[b"delivered"]),
+        now,
+    );
+    assert_eq!(waiting.try_recv().unwrap(), pair(b"set", b"delivered"));
+    empty_indexes(&owner);
+}
+
 #[tokio::test]
 async fn dropping_execute_notifies_a_dormant_owner_without_any_further_work() {
     let (client, done, mut count) = crate::state::observed().unwrap();

@@ -8,10 +8,14 @@ use std::thread;
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::command::{DatabaseCommand, ListEnd};
+use crate::command::{DatabaseCommand, ListEnd, parse_integer};
 use crate::resp::Reply;
 
 mod blocking;
+mod set;
+
+#[cfg(test)]
+mod numeric_sets_tests;
 
 use blocking::Owner;
 
@@ -34,6 +38,7 @@ impl DatabaseIndex {
 enum Value {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
+    Set(set::Set),
 }
 
 #[derive(Default)]
@@ -47,13 +52,13 @@ impl Databases {
     fn execute(&mut self, database: DatabaseIndex, command: DatabaseCommand) -> Reply {
         let entries = &mut self.0[usize::from(database.0)];
         // This entire match is one non-interleaved operation: its lookup/insert
-        // (or full EXISTS scan / variadic push) is the linearization point.
+        // (or full variadic operation / member snapshot) is the linearization point.
         // Replies own bytes; sending/dropping one cannot retain or undo access.
         match command {
             DatabaseCommand::Get(key) => match entries.get(&key) {
                 None => Reply::Bulk(None),
                 Some(Value::String(value)) => Reply::Bulk(Some(value.clone())),
-                Some(Value::List(_)) => wrong_type(),
+                Some(_) => wrong_type(),
             },
             DatabaseCommand::Set { key, value } => {
                 entries.insert(key, Value::String(value));
@@ -64,6 +69,73 @@ impl Databases {
                     .map(|key| i64::from(entries.contains_key(key)))
                     .sum(),
             ),
+            DatabaseCommand::Increment(key) => {
+                let current = match entries.get(&key) {
+                    None => 0,
+                    Some(Value::String(bytes)) => match parse_integer(bytes) {
+                        Some(value) => value,
+                        None => {
+                            return Reply::Error(
+                                b"ERR value is not an integer or out of range".to_vec(),
+                            );
+                        }
+                    },
+                    Some(_) => return wrong_type(),
+                };
+                let Some(next) = current.checked_add(1) else {
+                    return Reply::Error(b"ERR increment or decrement would overflow".to_vec());
+                };
+                entries.insert(key, Value::String(next.to_string().into_bytes()));
+                Reply::Integer(next)
+            }
+            DatabaseCommand::SetAdd { key, members } => {
+                let value = entries
+                    .entry(key)
+                    .or_insert_with(|| Value::Set(set::Set::default()));
+                let Value::Set(set) = value else {
+                    return wrong_type();
+                };
+                let added = members
+                    .into_iter()
+                    .map(|member| i64::from(set.insert(member)))
+                    .sum();
+                Reply::Integer(added)
+            }
+            DatabaseCommand::SetRemove { key, members } => {
+                let set = match entries.get_mut(&key) {
+                    None => return Reply::Integer(0),
+                    Some(Value::Set(set)) => set,
+                    Some(_) => return wrong_type(),
+                };
+                let removed = members
+                    .iter()
+                    .map(|member| i64::from(set.remove(member)))
+                    .sum();
+                if set.members.is_empty() {
+                    entries.remove(&key);
+                }
+                Reply::Integer(removed)
+            }
+            DatabaseCommand::SetContains { key, member } => match entries.get(&key) {
+                None => Reply::Integer(0),
+                Some(Value::Set(set)) => Reply::Integer(i64::from(set.contains(&member))),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::SetCardinality(key) => match entries.get(&key) {
+                None => Reply::Integer(0),
+                Some(Value::Set(set)) => Reply::Integer(set.members.len() as i64),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::SetMembers(key) => match entries.get(&key) {
+                None => Reply::Array(Some(vec![])),
+                Some(Value::Set(set)) => Reply::Array(Some(
+                    set.members
+                        .iter()
+                        .map(|member| Reply::Bulk(Some(member.clone())))
+                        .collect(),
+                )),
+                Some(_) => wrong_type(),
+            },
             DatabaseCommand::Push { end, key, values } => {
                 let value = entries
                     .entry(key)

@@ -3,8 +3,9 @@
 A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
-BLPOP, and BRPOP.** Sixteen in-memory databases hold strings or lists and belong
-to one dedicated state thread, separate from asynchronous networking. Blocking
+BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, and SMEMBERS.**
+Sixteen in-memory databases hold strings, lists, or sets and belong to one
+dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
 Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
 are verified. Transactions, Lua, and full crawler interoperability are not
@@ -86,6 +87,18 @@ redis-cli -2 -h 127.0.0.1 -p 6380 SET queue replaced
 # OK
 redis-cli -2 -h 127.0.0.1 -p 6380 GET queue
 # "replaced"
+redis-cli -2 -h 127.0.0.1 -p 6380 INCR next-id
+# (integer) 1
+redis-cli -2 -h 127.0.0.1 -p 6380 SADD seen page-a page-b page-a
+# (integer) 2
+redis-cli -2 -h 127.0.0.1 -p 6380 SISMEMBER seen page-a
+# (integer) 1
+redis-cli -2 -h 127.0.0.1 -p 6380 SCARD seen
+# (integer) 2
+redis-cli -2 -h 127.0.0.1 -p 6380 SMEMBERS seen
+# "page-a" and "page-b", in unspecified order
+redis-cli -2 -h 127.0.0.1 -p 6380 SREM seen page-a page-a missing
+# (integer) 1
 ```
 
 To demonstrate blocking, run this in another terminal:
@@ -152,13 +165,19 @@ persistence; every explicit restart starts empty.
 | `PING` | Simple string `PONG` |
 | `PING message` | Bulk string containing the exact message, including empty/binary bytes |
 | `SELECT index` | Simple string `OK`; only the first complete command attempt, index 0–15 |
-| `GET key` | Bulk string value, null bulk if absent, or `WRONGTYPE` for a list |
+| `GET key` | Bulk string value, null bulk if absent, or `WRONGTYPE` for a non-string |
 | `SET key value` | Simple string `OK`; overwrites any type with a string; **no options** |
 | `EXISTS key [key ...]` | Integer count for any type; repeated existing keys count repeatedly |
 | `LPUSH key value [value ...]` | Integer length after inserting all values at the head, in argument order |
 | `RPUSH key value [value ...]` | Integer length after inserting all values at the tail, in argument order |
 | `BLPOP key [key ...] timeout` | Two-bulk-string array `[key, head]`, or null array on timeout; 1–5 keys |
 | `BRPOP key [key ...] timeout` | Two-bulk-string array `[key, tail]`, or null array on timeout; 1–5 keys |
+| `INCR key` | Signed 64-bit integer after increment; absent starts at zero; stores exact decimal text |
+| `SADD key member [member ...]` | Integer count of newly added members, ignoring duplicates |
+| `SREM key member [member ...]` | Integer count of removed members; deletes an emptied set key |
+| `SISMEMBER key member` | Integer 1 if present, otherwise 0 (including absent key) |
+| `SCARD key` | Integer member count, or 0 for absent key |
+| `SMEMBERS key` | Unordered array of bulk-string members; empty array for absent key |
 
 Command names are ASCII case-insensitive; keys/values are opaque bytes, including
 empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
@@ -166,9 +185,9 @@ Indices use canonical decimal integer syntax (no `+`, whitespace, leading zeros,
 `-0`, or fractions). Invalid indices, wrong arity, SET options, empty command
 arrays, and unsupported commands return `ERR` replies without data mutation; the
 connection remains usable. Pushes create a list when the key is absent, and
-return `WRONGTYPE` without changing an existing string. GET rejects lists without
-mutation; bare SET replaces a list with a string. LPUSH reverses its supplied
-values at the head (`LPUSH k a b c` yields `[c, b, a]`); RPUSH appends them
+return `WRONGTYPE` without changing an existing non-list. GET rejects non-strings
+without mutation; bare SET replaces any supported type with a string. LPUSH
+reverses its supplied values at the head (`LPUSH k a b c` yields `[c, b, a]`); RPUSH appends them
 (`RPUSH k a b c` yields `[a, b, c]`). Duplicates and empty/binary elements are
 retained. The entire variadic push, including its returned length, is atomic.
 PING is exempt from linearizability and excluded from operation histories.
@@ -187,6 +206,20 @@ EOF within a request discards the incomplete request and closes silently; EOF
 between requests closes normally. Socket/write failures affect only that client;
 a connection-task panic stops the service. Half-close continuation is not a
 supported client mode.
+
+INCR accepts only canonical signed-64-bit decimal strings, with no floating-point
+conversion (including beyond 2^53). Invalid stored text returns `ERR value is not
+an integer or out of range`; incrementing 9223372036854775807 returns `ERR
+increment or decrement would overflow`. Both errors preserve the old value;
+non-string keys return `WRONGTYPE`. A successful INCR remains a string for GET.
+
+Set commands reject non-set values without mutation. SADD creates a set on a
+missing key; missing-key reads/SREM do not create one. Members are opaque binary
+strings, not numbers: `1`, `01`, and an empty member are distinct. SADD/SREM
+apply their whole variadic operation before any other command observes it;
+SMEMBERS is a single atomic snapshot, not ordered output. SET can replace a set
+with a string; EXISTS counts any supported type. Set creation/deletion does not
+wake blocked list pops; subsequent list activity still rechecks key/type priority.
 
 ### Resource limits and ordering
 
@@ -320,11 +353,35 @@ misrouting. Overflow/EOF/shutdown checks include queued mutations that must not
 self-release a blocked connection. Owner tests inspect all cleanup indexes and
 verify cancellation notification without any subsequent commands. Owner tests also
 exercise asynchronous backpressure, lost replies, and fail-stop panic supervision.
+Numeric/set tests cover signed boundaries and canonical parsing, exact IDs beyond
+2^53, overflow/nonmutation, all arities/types, binary/empty/large members,
+duplicates, empty-set deletion/recreation, all sixteen databases, dense-index
+churn, waiter type priority, fragmented ordered replies, concurrent unique ID
+allocation/overflow, and atomic variadic deduplication/removal/member snapshots.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
 Repeated schedules supplement the ownership argument below, not a proof or
 certification of future batch behavior or crawler compatibility.
+
+### Optional numeric/set reference comparison
+
+With Python 3 and a separately installed/built Redis **7.4.x** server on
+Linux/macOS/WSL2, run from the repository root:
+
+```sh
+cargo build --locked
+python3 tests/compare_numeric_sets.py --redis-server /absolute/path/to/redis-server
+```
+
+The script starts its own ephemeral Keyper TCP endpoint and a scratch Redis Unix
+socket (TCP/persistence disabled), compares **2,512** sequential commands including
+errors and deterministic set churn, and stops only its owned processes. SMEMBERS
+ordering is normalized; other reply types/values/errors must match exactly.
+Startup/I/O/shutdown waits are bounded; no existing Redis or crawler is touched.
+This opt-in check is separate from `cargo test` and is not a full Redis/crawler
+certification. Verified with Redis **7.4.0**; concurrent contracts are tested by
+the Rust suites, not this sequential comparison.
 
 ### Layout
 
@@ -332,6 +389,8 @@ certification of future batch behavior or crawler compatibility.
 - `src/resp.rs`: request framing, resource bounds, and RESP2 reply encoding.
 - `src/command.rs`: command admission, PING, and connection-local selection.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
+- `src/state/set.rs`: dense set members with a hash index for constant-time membership/removal.
+- `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
 - `src/state/blocking.rs`: pop eligibility, waiter indexes, owner loop, and deadlines.
 - `src/state/blocking/tests.rs`: deterministic owner-level blocking tests.
 - `src/server.rs`: loopback listener, ordered connection tasks, writes, supervision.
@@ -340,6 +399,8 @@ certification of future batch behavior or crawler compatibility.
 - `src/main.rs`: arguments, two-worker Tokio entry point, signals, diagnostics.
 - `tests/cli.rs`, `tests/transport.rs`, `tests/databases.rs`: process/socket checks.
 - `tests/pipelining.rs`: raw pipelines and actual Redis 1.7.1 startup/multiplexing.
+- `tests/numeric_sets.rs`: numeric/set wire, boundary, and concurrent allocation/dedup tests.
+- `tests/compare_numeric_sets.py`: opt-in comparison with an owned reference Redis.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -352,7 +413,14 @@ it never samples different moments for repeated arguments. A push linearizes
 after all insertions, when its resulting length is captured; a wrong-type push
 linearizes at the type check without mutation. No other operation can observe a
 partial push. Waiter service runs after this complete unit and its reply capture,
-not between elements. SELECT linearizes at the connection-local
+not between elements. INCR linearizes at its checked replacement; invalid text,
+overflow, and wrong-type outcomes linearize at the indivisible check without
+mutation. Entire SADD/SREM operations (including empty-key removal) linearize
+after all arguments; SISMEMBER/SCARD at lookup, and SMEMBERS during its indivisible
+member snapshot. A concurrent deduplication race adds each member once, and
+successful increments allocate distinct exact IDs until signed overflow. These
+are individual operations, not a substitute for future script/EXEC atomicity.
+SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
 touching data. Other clients cannot change a connection's selected database.
 PING is not in histories.
@@ -365,9 +433,15 @@ network I/O. Hash-map lookup/insertion is average O(1); EXISTS is O(N) in suppli
 key arguments, as in the [Redis command reference](https://redis.io/docs/latest/commands/).
 Lists use `VecDeque`, with amortized O(1) insertion at either end and amortized
 O(N) for N inserted elements, without shifting the list on every LPUSH. No whole-database
-scan or copy is involved. Hashing/copying/serialization also costs the number of
-bytes involved; replacing a list additionally frees its old elements. Databases
-are isolated namespaces, not independently executing owner threads.
+scan or copy is involved. INCR parses at most 20 bytes and uses checked i64
+arithmetic. Sets use a dense member vector plus a hash index: average O(1)
+membership/cardinality/insert/remove, amortized O(N) for N SADD/SREM arguments,
+and O(current cardinality) SMEMBERS even after heavy removal (rather than scanning
+a sparse hash table's historical capacity). Swap-removal leaves member order
+unspecified. This direct layout stores each member's bytes twice; no additional
+dependency is needed. Hashing/copying/serialization also costs the number of
+bytes involved; replacing a collection additionally frees its old elements.
+Databases are isolated namespaces, not independently executing owner threads.
 
 A dropped reply receiver lets the owner skip an operation that has not begun.
 Cancellation racing with execution can instead lose the response to an applied
@@ -446,8 +520,8 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: the audited numeric/set commands, followed by hash and remaining list/key
-commands. Actual atomic-batch integration remains unimplemented/unverified.
+Next: the audited hash commands, followed by the remaining list/key commands.
+Actual atomic-batch integration remains unimplemented/unverified.
 
 Later work includes genuine Lua 5.1 and MULTI/EXEC/DISCARD for an **unmodified**
 external crawler. Crawler sources and Git state must not be changed;

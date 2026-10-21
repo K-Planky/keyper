@@ -17,6 +17,21 @@ pub(crate) enum DatabaseCommand {
         value: Vec<u8>,
     },
     Exists(Vec<Vec<u8>>),
+    Increment(Vec<u8>),
+    SetAdd {
+        key: Vec<u8>,
+        members: Vec<Vec<u8>>,
+    },
+    SetRemove {
+        key: Vec<u8>,
+        members: Vec<Vec<u8>>,
+    },
+    SetContains {
+        key: Vec<u8>,
+        member: Vec<u8>,
+    },
+    SetCardinality(Vec<u8>),
+    SetMembers(Vec<u8>),
     Push {
         end: ListEnd,
         key: Vec<u8>,
@@ -121,6 +136,44 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity("exists"));
         }
         Ok(Command::Database(DatabaseCommand::Exists(args.collect())))
+    } else if name.eq_ignore_ascii_case(b"INCR") {
+        if args.len() != 1 {
+            return Err(wrong_arity("incr"));
+        }
+        Ok(Command::Database(DatabaseCommand::Increment(
+            args.next().unwrap(),
+        )))
+    } else if name.eq_ignore_ascii_case(b"SADD") || name.eq_ignore_ascii_case(b"SREM") {
+        let add = name.eq_ignore_ascii_case(b"SADD");
+        if args.len() < 2 {
+            return Err(wrong_arity(if add { "sadd" } else { "srem" }));
+        }
+        let key = args.next().unwrap();
+        let members = args.collect();
+        Ok(Command::Database(if add {
+            DatabaseCommand::SetAdd { key, members }
+        } else {
+            DatabaseCommand::SetRemove { key, members }
+        }))
+    } else if name.eq_ignore_ascii_case(b"SISMEMBER") {
+        if args.len() != 2 {
+            return Err(wrong_arity("sismember"));
+        }
+        Ok(Command::Database(DatabaseCommand::SetContains {
+            key: args.next().unwrap(),
+            member: args.next().unwrap(),
+        }))
+    } else if name.eq_ignore_ascii_case(b"SCARD") || name.eq_ignore_ascii_case(b"SMEMBERS") {
+        let cardinality = name.eq_ignore_ascii_case(b"SCARD");
+        if args.len() != 1 {
+            return Err(wrong_arity(if cardinality { "scard" } else { "smembers" }));
+        }
+        let key = args.next().unwrap();
+        Ok(Command::Database(if cardinality {
+            DatabaseCommand::SetCardinality(key)
+        } else {
+            DatabaseCommand::SetMembers(key)
+        }))
     } else if name.eq_ignore_ascii_case(b"LPUSH") || name.eq_ignore_ascii_case(b"RPUSH") {
         let (end, command) = if name.eq_ignore_ascii_case(b"LPUSH") {
             (ListEnd::Left, "lpush")
@@ -161,13 +214,20 @@ fn parse(request: Request) -> Result<Command, Reply> {
     }
 }
 
-fn parse_database(bytes: &[u8]) -> Result<DatabaseIndex, Reply> {
-    // Redis integers are canonical decimal: no '+', whitespace, leading zero,
-    // '-0', fraction, or trailing bytes. Rust's integer parser alone is looser.
-    let index = std::str::from_utf8(bytes)
+/// Redis signed integers are canonical decimal, unlike Rust's looser parser.
+/// Bound the scan before UTF-8/number conversion, even for huge stored strings.
+pub(crate) fn parse_integer(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() > 20 {
+        return None;
+    }
+    std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| text.parse::<i64>().ok())
-        .filter(|index| index.to_string().as_bytes() == bytes)
+        .filter(|value| value.to_string().as_bytes() == bytes)
+}
+
+fn parse_database(bytes: &[u8]) -> Result<DatabaseIndex, Reply> {
+    let index = parse_integer(bytes)
         .ok_or_else(|| Reply::Error(b"ERR value is not an integer or out of range".to_vec()))?;
     let index = i32::try_from(index).map_err(|_| {
         Reply::Error(
@@ -219,6 +279,87 @@ mod tests {
         ] {
             assert!(matches!(parse(request(&args)), Err(Reply::Error(_))));
         }
+    }
+
+    #[test]
+    fn numeric_set_admission_preserves_binary_arguments_and_checks_arity() {
+        let key = b"\0\xff".to_vec();
+        let members = vec![vec![], b"a\r\n".to_vec(), vec![]];
+        for (args, command) in [
+            (
+                vec![&b"iNcR"[..], &key],
+                DatabaseCommand::Increment(key.clone()),
+            ),
+            (
+                vec![b"sAdD", &key, b"", b"a\r\n", b""],
+                DatabaseCommand::SetAdd {
+                    key: key.clone(),
+                    members: members.clone(),
+                },
+            ),
+            (
+                vec![b"sReM", &key, b"", b"a\r\n", b""],
+                DatabaseCommand::SetRemove {
+                    key: key.clone(),
+                    members,
+                },
+            ),
+            (
+                vec![b"sIsMeMbEr", &key, b""],
+                DatabaseCommand::SetContains {
+                    key: key.clone(),
+                    member: vec![],
+                },
+            ),
+            (
+                vec![b"sCaRd", &key],
+                DatabaseCommand::SetCardinality(key.clone()),
+            ),
+            (
+                vec![b"sMeMbErS", &key],
+                DatabaseCommand::SetMembers(key.clone()),
+            ),
+        ] {
+            assert_eq!(parse(request(&args)), Ok(Command::Database(command)));
+        }
+        for (name, required, variadic) in [
+            (&b"INCR"[..], 1, false),
+            (b"SADD", 2, true),
+            (b"SREM", 2, true),
+            (b"SISMEMBER", 2, false),
+            (b"SCARD", 1, false),
+            (b"SMEMBERS", 1, false),
+        ] {
+            for count in 0..=required + 1 {
+                let mut args = vec![name];
+                args.extend(vec![&b""[..]; count]);
+                assert_eq!(
+                    parse(request(&args)).is_ok(),
+                    count == required || (variadic && count > required)
+                );
+            }
+        }
+        for value in [i64::MIN, -1, 0, 1, 9_007_199_254_740_993, i64::MAX] {
+            assert_eq!(parse_integer(value.to_string().as_bytes()), Some(value));
+        }
+        for bytes in [
+            &b""[..],
+            b"+1",
+            b"01",
+            b"-0",
+            b"-01",
+            b" 1",
+            b"1 ",
+            b"1.0",
+            b"1e0",
+            b"1\0",
+            b"\xff",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+        ] {
+            assert_eq!(parse_integer(bytes), None);
+        }
+        assert_eq!(parse_integer(&vec![b'1'; 8192]), None);
     }
 
     #[test]

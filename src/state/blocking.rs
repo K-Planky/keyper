@@ -85,7 +85,7 @@ impl Databases {
         for key in &pop.keys {
             match entries.get_mut(key) {
                 None => continue,
-                Some(Value::String(_)) => return Some(wrong_type()),
+                Some(Value::String(_) | Value::Set(_)) => return Some(wrong_type()),
                 Some(Value::List(list)) => {
                     let value = match pop.end {
                         ListEnd::Left => list.pop_front(),
