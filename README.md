@@ -4,7 +4,7 @@ A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
 BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
-HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, and HVALS.**
+HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS, TYPE, LLEN, LINDEX, and LPOP.**
 Sixteen in-memory databases hold strings, lists, sets, or hashes and belong to one
 dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
@@ -114,6 +114,23 @@ redis-cli -2 -h 127.0.0.1 -p 6380 HVALS record
 # "done" and "0", in unspecified order
 redis-cli -2 -h 127.0.0.1 -p 6380 HDEL record processed processed missing
 # (integer) 1
+redis-cli -2 -h 127.0.0.1 -p 6380 RPUSH list-demo one two three
+# (integer) 3
+redis-cli -2 -h 127.0.0.1 -p 6380 TYPE list-demo
+# list
+redis-cli -2 -h 127.0.0.1 -p 6380 LLEN list-demo
+# (integer) 3
+redis-cli -2 -h 127.0.0.1 -p 6380 LINDEX list-demo -1
+# "three"
+redis-cli -2 -h 127.0.0.1 -p 6380 LPOP list-demo 0
+# (empty array); the list is unchanged
+redis-cli -2 -h 127.0.0.1 -p 6380 LPOP list-demo
+# "one"
+redis-cli -2 -h 127.0.0.1 -p 6380 LPOP list-demo 10
+# 1) "two"
+# 2) "three"
+redis-cli -2 -h 127.0.0.1 -p 6380 TYPE list-demo
+# none; removing the last element deletes the key
 ```
 
 To demonstrate blocking, run this in another terminal:
@@ -200,13 +217,17 @@ persistence; every explicit restart starts empty.
 | `HLEN key` | Integer field count, or 0 for an absent key |
 | `HGETALL key` | Flat array of alternating bulk-string fields/values; empty array for an absent key; pair order unspecified |
 | `HVALS key` | Unordered bulk-string value array, retaining duplicates; empty array for an absent key |
+| `TYPE key` | Simple string `none`, `string`, `list`, `set`, or `hash` |
+| `LLEN key` | Integer list length, or 0 for an absent key |
+| `LINDEX key index` | Bulk string at a zero-based index; negative indices count from the tail; null bulk if absent/out of bounds |
+| `LPOP key [count]` | Without count: head bulk string or null bulk; with count: array of up to count head elements, or null array if the key is absent |
 
 Command names are ASCII case-insensitive; keys/values are opaque bytes, including
 empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
-Indices use canonical decimal integer syntax (no `+`, whitespace, leading zeros,
-`-0`, or fractions). Invalid indices, wrong arity, SET options, empty command
-arrays, and unsupported commands return `ERR` replies without data mutation; the
-connection remains usable. Pushes create a list when the key is absent, and
+Integer arguments use canonical decimal syntax (no `+`, whitespace, leading zeros,
+`-0`, or fractions). Invalid numeric arguments (subject to LINDEX's lookup order
+below), wrong arity, SET options, empty command arrays, and unsupported commands
+return `ERR` replies without data mutation; the connection remains usable. Pushes create a list when the key is absent, and
 return `WRONGTYPE` without changing an existing non-list. GET rejects non-strings
 without mutation; bare SET replaces any supported type with a string. LPUSH
 reverses its supplied values at the head (`LPUSH k a b c` yields `[c, b, a]`); RPUSH appends them
@@ -253,6 +274,22 @@ one indivisible snapshot of that hash, not several independent field reads.
 **Separate commands, even pipelined, are not a coherent multi-key snapshot**;
 the crawler's transaction boundary remains future work. SET replaces hashes;
 EXISTS counts them; hash creation/deletion does not wake blocked list pops.
+
+TYPE never creates a key and reports only the types implemented here. LLEN,
+LINDEX, and LPOP reject non-lists without mutation. LINDEX accepts signed-64-bit
+indices: 0 is the head, -1 the tail, and any out-of-bounds index returns null.
+As in Redis 7.4, it checks existence/type **before** converting the index: an
+absent key returns null and a non-list returns WRONGTYPE even for invalid text.
+LPOP instead validates its optional **nonnegative signed-64-bit count first**,
+returning `ERR value is out of range, must be positive` for invalid/negative
+counts (zero is valid). `LPOP key 0` returns an empty array for a list, null array
+for an absent key, and WRONGTYPE for a non-list. Supplying count 1 still returns
+an array, not a scalar. Huge valid counts are capped by the current list length,
+not used as allocation sizes. All counted removals and last-element key deletion
+are one atomic operation. List reads and empty LPOP do not wake/reorder blocked
+waiters; existing waiters get their post-push service before a later LPOP runs.
+Separate LINDEX and LPOP calls do **not** form an atomic claim; that requires the
+future script boundary used by the crawler.
 
 ### Resource limits and ordering
 
@@ -341,9 +378,9 @@ Dropping a caller's Redis-client query future is **not** retracting a dispatched
 request: the multiplexed driver can keep its connection/work alive and drain the
 reply. Later cloned queries remain behind it. No retry or rollback is implied;
 mutations with lost responses remain ambiguous. Actual socket closure follows
-the EOF cancellation policy above. Full crawler commands still need the audited
-extra commands, transactions, and genuine Lua; client compatibility alone does
-not certify crawler jobs.
+the EOF cancellation policy above. Full crawler commands still need EVAL with
+genuine Lua and transactions; client compatibility alone does not certify
+crawler jobs.
 
 ## Development checks
 
@@ -397,6 +434,12 @@ flat RESP2 pairs, arity/nonmutation, type interactions, all sixteen databases,
 last-field deletion/recreation, maximum variadic pairs, incomplete framing,
 index churn against an independent ordered map, waiter type rechecking, and
 concurrent whole-record creation/deletion/replacement with real-time fences.
+List/key tests cover all four added commands, exact RESP2 status/scalar/array/null
+forms, signed index/count bounds, numeric/type-error precedence, binary/empty/large
+values, all sixteen databases, deletion/type transitions, incomplete pop framing,
+independent-vector churn, waiter priority, concurrent disjoint counted ranges,
+whole-batch length/head observations, and mixed producer/scalar/counted/blocking
+pop item accounting with real-time fences.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
@@ -439,6 +482,25 @@ must remain intact. The script reuses the numeric/set harness's bounded process
 runner. Neither comparison substitutes for concurrent tests, future transactions,
 Lua, or a full crawler run; missing prerequisites or mismatches exit nonzero.
 
+### Optional list/key reference comparison
+
+Using the same Python/Redis prerequisites and owned-endpoint policy:
+
+```sh
+cargo build --locked
+python3 tests/compare_lists.py --redis-server /absolute/path/to/redis-server
+```
+
+Verified with Redis **7.4.0**: **2,734** commands covering TYPE, LLEN, LINDEX,
+LPOP (including optional count), all arities/types, signed boundaries, error
+precedence, binary/empty data, deletion/recreation, and deterministic list churn.
+Replies are compared **exactly**, without normalization; scalar/null bulk and
+array/null array must remain distinct. This reuses the same bounded process
+runner; missing prerequisites or mismatches exit nonzero. It does not verify
+transactions, scripts, or full crawler jobs. The crawler's original Redis suites
+also require test-only SCAN/DEL/LRANGE/LSET/TTL, which remain unsupported; these
+Keyper-owned checks are not a claim those suites pass on Keyper.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
@@ -449,6 +511,7 @@ Lua, or a full crawler run; missing prerequisites or mismatches exit nonzero.
 - `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
 - `src/state/hash.rs`: dense field/value pairs with a lookup index and unspecified ordering.
 - `src/state/hashes_tests.rs`: hash semantics, type interactions, and independent-map churn checks.
+- `src/state/lists_tests.rs`: list/key semantics, numeric precedence, and independent-vector churn.
 - `src/state/blocking.rs`: pop eligibility, waiter indexes, owner loop, and deadlines.
 - `src/state/blocking/tests.rs`: deterministic owner-level blocking tests.
 - `src/server.rs`: loopback listener, ordered connection tasks, writes, supervision.
@@ -459,8 +522,10 @@ Lua, or a full crawler run; missing prerequisites or mismatches exit nonzero.
 - `tests/pipelining.rs`: raw pipelines and actual Redis 1.7.1 startup/multiplexing.
 - `tests/numeric_sets.rs`: numeric/set wire, boundary, and concurrent allocation/dedup tests.
 - `tests/hashes.rs`: hash wire shapes, boundaries, and concurrent whole-record operations.
+- `tests/lists.rs`: list/key wire shapes, boundaries, counted-pop atomicity and item accounting.
 - `tests/compare_numeric_sets.py`: opt-in numeric/set comparison and shared owned-endpoint runner.
 - `tests/compare_hashes.py`: opt-in hash comparison with an owned reference Redis.
+- `tests/compare_lists.py`: opt-in exact list/key comparison with an owned reference Redis.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -483,7 +548,10 @@ HSET/HDEL linearize after all fields, including last-field key deletion; HGET,
 HEXISTS, and HLEN at lookup; HGETALL/HVALS during their indivisible hash snapshot.
 Wrong-type outcomes linearize at the type check without mutation. A reader
 cannot observe a partially updated variadic record, but separate reads can see
-different moments. These are individual operations, not a substitute for future
+different moments. TYPE, LLEN, and LINDEX linearize at their owner lookup/index
+check; LPOP at its entire removal and any empty-key deletion, never between
+returned elements. Missing/type/numeric errors are indivisible owner decisions
+with no mutation. These are individual operations, not a substitute for future
 script/EXEC atomicity.
 SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
@@ -498,7 +566,11 @@ network I/O. Hash-map lookup/insertion is average O(1); EXISTS is O(N) in suppli
 key arguments, as in the [Redis command reference](https://redis.io/docs/latest/commands/).
 Lists use `VecDeque`, with amortized O(1) insertion at either end and amortized
 O(N) for N inserted elements, without shifting the list on every LPUSH. No whole-database
-scan or copy is involved. INCR parses at most 20 bytes and uses checked i64
+scan or copy is involved. TYPE and LLEN are average O(1); VecDeque provides
+O(1) LINDEX access (at least as good as Redis's O(distance) bound, including O(1)
+at either end). LPOP is O(number returned), moving only the requested head prefix,
+not shifting/copying the remaining list. Huge indices/counts cannot wrap or cause
+count-sized preallocation. INCR parses at most 20 bytes and uses checked i64
 arithmetic. Sets use a dense member vector plus a hash index: average O(1)
 membership/cardinality/insert/remove, amortized O(N) for N SADD/SREM arguments,
 and O(current cardinality) SMEMBERS even after heavy removal (rather than scanning
@@ -589,11 +661,11 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: the remaining audited list/key commands (TYPE, LLEN, LINDEX, LPOP).
-Actual atomic-batch integration remains unimplemented/unverified.
+Next: genuine MULTI/EXEC/DISCARD transactions, including the crawler's coherent
+six-read snapshot. Actual atomic-batch integration remains unimplemented/unverified.
 
-Later work includes genuine Lua 5.1 and MULTI/EXEC/DISCARD for an **unmodified**
-external crawler. Crawler sources and Git state must not be changed;
+Later work includes genuine Lua 5.1/EVAL and full-process verification of the
+**unmodified** external crawler. Crawler sources and Git state must not be changed;
 compatibility code and harnesses belong here.
 Neither crawler interoperability nor any live demo has been verified. Broad
 Redis compatibility, RESP3, authentication, pub/sub, and public-network hardening

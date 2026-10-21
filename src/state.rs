@@ -18,6 +18,8 @@ mod set;
 #[cfg(test)]
 mod hashes_tests;
 #[cfg(test)]
+mod lists_tests;
+#[cfg(test)]
 mod numeric_sets_tests;
 
 use blocking::Owner;
@@ -73,6 +75,77 @@ impl Databases {
                     .map(|key| i64::from(entries.contains_key(key)))
                     .sum(),
             ),
+            DatabaseCommand::Type(key) => Reply::Simple(
+                match entries.get(&key) {
+                    None => &b"none"[..],
+                    Some(Value::String(_)) => b"string",
+                    Some(Value::List(_)) => b"list",
+                    Some(Value::Set(_)) => b"set",
+                    Some(Value::Hash(_)) => b"hash",
+                }
+                .to_vec(),
+            ),
+            DatabaseCommand::ListLength(key) => match entries.get(&key) {
+                None => Reply::Integer(0),
+                Some(Value::List(list)) => Reply::Integer(list.len() as i64),
+                Some(_) => wrong_type(),
+            },
+            DatabaseCommand::ListIndex { key, index } => {
+                // Redis checks existence/type before converting the index.
+                let list = match entries.get(&key) {
+                    None => return Reply::Bulk(None),
+                    Some(Value::List(list)) => list,
+                    Some(_) => return wrong_type(),
+                };
+                let Some(index) = parse_integer(&index) else {
+                    return Reply::Error(b"ERR value is not an integer or out of range".to_vec());
+                };
+                // unsigned_abs also handles i64::MIN; no wrapping negation or
+                // truncation on narrower targets. VecDeque indexing is O(1).
+                let offset = if index < 0 {
+                    usize::try_from(index.unsigned_abs())
+                        .ok()
+                        .and_then(|distance| list.len().checked_sub(distance))
+                } else {
+                    usize::try_from(index).ok()
+                };
+                Reply::Bulk(offset.and_then(|offset| list.get(offset).cloned()))
+            }
+            DatabaseCommand::ListPop { key, count } => {
+                // Unlike LINDEX, count validation precedes even a missing or
+                // wrong-type lookup. Retain presence for scalar/array replies.
+                let count = match count {
+                    None => None,
+                    Some(bytes) => match parse_integer(&bytes).filter(|n| *n >= 0) {
+                        Some(n) => Some(n as u64),
+                        None => {
+                            return Reply::Error(
+                                b"ERR value is out of range, must be positive".to_vec(),
+                            );
+                        }
+                    },
+                };
+                let list = match entries.get_mut(&key) {
+                    None if count.is_some() => return Reply::Array(None),
+                    None => return Reply::Bulk(None),
+                    Some(Value::List(list)) => list,
+                    Some(_) => return wrong_type(),
+                };
+                let result = if let Some(count) = count {
+                    // Clamp before conversion/allocation: huge valid counts
+                    // cost only the number of elements actually returned.
+                    let take = count.min(list.len() as u64) as usize;
+                    Reply::Array(Some(
+                        list.drain(..take).map(|v| Reply::Bulk(Some(v))).collect(),
+                    ))
+                } else {
+                    Reply::Bulk(list.pop_front())
+                };
+                if list.is_empty() {
+                    entries.remove(&key);
+                }
+                result
+            }
             DatabaseCommand::Increment(key) => {
                 let current = match entries.get(&key) {
                     None => 0,

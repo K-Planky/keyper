@@ -17,6 +17,16 @@ pub(crate) enum DatabaseCommand {
         value: Vec<u8>,
     },
     Exists(Vec<Vec<u8>>),
+    Type(Vec<u8>),
+    ListLength(Vec<u8>),
+    ListIndex {
+        key: Vec<u8>,
+        index: Vec<u8>,
+    },
+    ListPop {
+        key: Vec<u8>,
+        count: Option<Vec<u8>>,
+    },
     Increment(Vec<u8>),
     SetAdd {
         key: Vec<u8>,
@@ -155,6 +165,33 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity("exists"));
         }
         Ok(Command::Database(DatabaseCommand::Exists(args.collect())))
+    } else if name.eq_ignore_ascii_case(b"TYPE") || name.eq_ignore_ascii_case(b"LLEN") {
+        let kind = name.eq_ignore_ascii_case(b"TYPE");
+        if args.len() != 1 {
+            return Err(wrong_arity(if kind { "type" } else { "llen" }));
+        }
+        let key = args.next().unwrap();
+        Ok(Command::Database(if kind {
+            DatabaseCommand::Type(key)
+        } else {
+            DatabaseCommand::ListLength(key)
+        }))
+    } else if name.eq_ignore_ascii_case(b"LINDEX") {
+        if args.len() != 2 {
+            return Err(wrong_arity("lindex"));
+        }
+        Ok(Command::Database(DatabaseCommand::ListIndex {
+            key: args.next().unwrap(),
+            index: args.next().unwrap(),
+        }))
+    } else if name.eq_ignore_ascii_case(b"LPOP") {
+        if !(1..=2).contains(&args.len()) {
+            return Err(wrong_arity("lpop"));
+        }
+        Ok(Command::Database(DatabaseCommand::ListPop {
+            key: args.next().unwrap(),
+            count: args.next(),
+        }))
     } else if name.eq_ignore_ascii_case(b"INCR") {
         if args.len() != 1 {
             return Err(wrong_arity("incr"));
@@ -312,6 +349,44 @@ mod tests {
 
     fn request(args: &[&[u8]]) -> Request {
         args.iter().map(|arg| arg.to_vec()).collect()
+    }
+
+    #[test]
+    fn list_key_admission_checks_arity_but_defers_integer_validation() {
+        for (name, required) in [
+            (b"tYpE".as_slice(), 1),
+            (b"lLeN", 1),
+            (b"lInDeX", 2),
+            (b"lPoP", 1),
+        ] {
+            for count in 0..5 {
+                let mut args = vec![name];
+                args.resize(count + 1, b"\0\xff");
+                let valid = count == required || (name == b"lPoP" && count == 2);
+                assert_eq!(parse(request(&args)).is_ok(), valid);
+            }
+        }
+        assert_eq!(
+            parse(request(&[b"LINDEX", b"", b"invalid"])),
+            Ok(Command::Database(DatabaseCommand::ListIndex {
+                key: vec![],
+                index: b"invalid".to_vec()
+            }))
+        );
+        assert_eq!(
+            parse(request(&[b"LPOP", b"", b"-1"])),
+            Ok(Command::Database(DatabaseCommand::ListPop {
+                key: vec![],
+                count: Some(b"-1".to_vec())
+            }))
+        );
+        assert_eq!(
+            parse(request(&[b"LPOP", b"\0\xff"])),
+            Ok(Command::Database(DatabaseCommand::ListPop {
+                key: b"\0\xff".to_vec(),
+                count: None
+            }))
+        );
     }
 
     #[test]

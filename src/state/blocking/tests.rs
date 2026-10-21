@@ -64,6 +64,79 @@ fn empty_indexes(owner: &Owner) {
 }
 
 #[test]
+fn list_reads_and_empty_lpop_do_not_wake_or_reorder_waiters_and_cannot_steal_a_push() {
+    let now = Instant::now();
+    let mut owner = Owner::default();
+    let mut first = send(&mut owner, DB, pop(ListEnd::Left, &[b"list"], b"0"), now);
+    let mut second = send(&mut owner, DB, pop(ListEnd::Right, &[b"list"], b"0"), now);
+    for (command, expected) in [
+        (
+            DatabaseCommand::Type(b"list".to_vec()),
+            Reply::Simple(b"none".to_vec()),
+        ),
+        (
+            DatabaseCommand::ListLength(b"list".to_vec()),
+            Reply::Integer(0),
+        ),
+        (
+            DatabaseCommand::ListIndex {
+                key: b"list".to_vec(),
+                index: b"-1".to_vec(),
+            },
+            Reply::Bulk(None),
+        ),
+        (
+            DatabaseCommand::ListPop {
+                key: b"list".to_vec(),
+                count: None,
+            },
+            Reply::Bulk(None),
+        ),
+        (
+            DatabaseCommand::ListPop {
+                key: b"list".to_vec(),
+                count: Some(b"0".to_vec()),
+            },
+            Reply::Array(None),
+        ),
+    ] {
+        assert_eq!(execute(&mut owner, DB, command, now), expected);
+        pending(&mut first);
+        pending(&mut second);
+        assert_eq!(owner.waiters.len(), 2);
+    }
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            push(ListEnd::Right, b"list", &[b"a", b"b", b"c", b"d"]),
+            now
+        ),
+        Reply::Integer(4)
+    );
+    // Prior waiters are subsequent owner work before another client's LPOP.
+    assert_eq!(first.try_recv(), Ok(pair(b"list", b"a")));
+    assert_eq!(second.try_recv(), Ok(pair(b"list", b"d")));
+    assert_eq!(
+        execute(
+            &mut owner,
+            DB,
+            DatabaseCommand::ListPop {
+                key: b"list".to_vec(),
+                count: Some(b"2".to_vec())
+            },
+            now
+        ),
+        Reply::Array(Some(vec![
+            Reply::Bulk(Some(b"b".to_vec())),
+            Reply::Bulk(Some(b"c".to_vec()))
+        ]))
+    );
+    empty_indexes(&owner);
+    assert!(owner.databases.0[0].is_empty());
+}
+
+#[test]
 fn hash_creation_and_deletion_do_not_wake_waiters_but_later_list_activity_rechecks_types() {
     let now = Instant::now();
     let mut owner = Owner::default();
