@@ -509,6 +509,9 @@ async fn lost_pop_reply_does_not_requeue_and_shutdown_drains_pending_sockets() {
         let timeout = if n % 2 == 0 { &b"0"[..] } else { b"1000.5" };
         send(&mut client, &[b"BLPOP", b"pending", timeout]).await;
         server.count(n + 1).await;
+        let mut queued = request(&[b"SET", b"queued-at-shutdown", b"must-not-run"]);
+        queued.extend(request(&[b"RPUSH", b"pending", b"cannot-self-release"]));
+        bounded(client.write_all(&queued)).await.unwrap();
         blocked.push(client);
     }
     let mut idle = server.connect().await;
@@ -591,7 +594,8 @@ async fn excessive_queued_input_closes_and_cancels_instead_of_hiding_eof() {
     let mut client = server.connect().await;
     send(&mut client, &[b"BLPOP", b"k", b"0"]).await;
     server.count(1).await;
-    let bytes = vec![b'x'; input::MAX_READ_AHEAD_BYTES + 1];
+    let mut bytes = request(&[b"SET", b"queued-mutation", b"must-not-run"]);
+    bytes.resize(input::MAX_READ_AHEAD_BYTES + 1, b'x');
     if let Err(error) = bounded(client.write_all(&bytes)).await {
         assert!(matches!(
             error.kind(),
@@ -606,6 +610,10 @@ async fn excessive_queued_input_closes_and_cancels_instead_of_hiding_eof() {
     }
     let mut other = server.connect().await;
     assert_eq!(
+        call(&mut other, &[b"EXISTS", b"queued-mutation"]).await,
+        Reply::Integer(0)
+    );
+    assert_eq!(
         call(&mut other, &[b"RPUSH", b"k", b"retained"]).await,
         Reply::Integer(1)
     );
@@ -613,6 +621,76 @@ async fn excessive_queued_input_closes_and_cancels_instead_of_hiding_eof() {
         call(&mut other, &[b"BLPOP", b"k", b"0"]).await,
         pair(b"k", b"retained")
     );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_pipeline_cannot_release_itself_and_resumes_through_errors_and_partial_input() {
+    let mut server = TestServer::start().await;
+    let mut client = server.connect().await;
+    let mut other = server.connect().await;
+    let mut bytes = request(&[b"SET", b"interleaved", b"before"]);
+    bytes.extend(request(&[b"BLPOP", b"k", b"0"]));
+    bytes.extend(request(&[b"PING", b"after-first"]));
+    bytes.extend(request(&[b"GET", b"interleaved"]));
+    bytes.extend(request(&[b"UNKNOWN"]));
+    bytes.extend(request(&[b"RPUSH", b"k", b"self-push"]));
+    bytes.extend(request(&[b"BRPOP", b"k", b"0"]));
+    bytes.extend(request(&[b"SET", b"partial", b"\0\xff\r\n"]));
+    // Leave the SET terminator incomplete across read-ahead and socket input.
+    let split = bytes.len() - 1;
+    bounded(client.write_all(&bytes[..split])).await.unwrap();
+    server.count(1).await;
+    assert_eq!(receive(&mut client).await, ok());
+    // A pipeline orders this connection but is NOT a transaction. Its prefix
+    // is visible and another client can intervene before the suffix executes.
+    assert_eq!(
+        call(&mut other, &[b"GET", b"interleaved"]).await,
+        Reply::Bulk(Some(b"before".to_vec()))
+    );
+    assert_eq!(
+        call(&mut other, &[b"SET", b"interleaved", b"between"]).await,
+        ok()
+    );
+    assert_eq!(
+        call(&mut other, &[b"EXISTS", b"k", b"partial"]).await,
+        Reply::Integer(0)
+    );
+    assert_eq!(
+        call(&mut other, &[b"RPUSH", b"k", b"external"]).await,
+        Reply::Integer(1)
+    );
+    assert_eq!(receive(&mut client).await, pair(b"k", b"external"));
+    assert_eq!(
+        receive(&mut client).await,
+        Reply::Bulk(Some(b"after-first".to_vec()))
+    );
+    assert_eq!(
+        receive(&mut client).await,
+        Reply::Bulk(Some(b"between".to_vec()))
+    );
+    assert!(
+        matches!(receive(&mut client).await, Reply::Error(error) if error == b"ERR unknown command")
+    );
+    assert_eq!(receive(&mut client).await, Reply::Integer(1));
+    assert_eq!(receive(&mut client).await, pair(b"k", b"self-push"));
+    assert_eq!(
+        call(&mut other, &[b"GET", b"partial"]).await,
+        Reply::Bulk(None)
+    );
+    let mut tail = bytes[split..].to_vec();
+    tail.extend(request(&[b"GET", b"partial"]));
+    tail.extend(request(&[b"BRPOP", b"empty", b"0.001"]));
+    tail.extend(request(&[b"PING"]));
+    bounded(client.write_all(&tail)).await.unwrap();
+    assert_eq!(receive(&mut client).await, ok());
+    assert_eq!(
+        receive(&mut client).await,
+        Reply::Bulk(Some(b"\0\xff\r\n".to_vec()))
+    );
+    assert_eq!(receive(&mut client).await, Reply::Array(None));
+    assert_eq!(receive(&mut client).await, Reply::Simple(b"PONG".to_vec()));
+    server.count(0).await;
     server.stop().await;
 }
 

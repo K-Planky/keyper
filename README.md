@@ -6,7 +6,9 @@ A small, in-memory Redis-compatible service being built in Rust on Tokio.
 BLPOP, and BRPOP.** Sixteen in-memory databases hold strings or lists and belong
 to one dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
-Transactions, Lua, and crawler interoperability are not implemented yet.
+Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
+are verified. Transactions, Lua, and full crawler interoperability are not
+implemented yet.
 
 ## Prerequisites and build
 
@@ -27,10 +29,13 @@ cargo build --locked
 cargo run --locked -- --help
 ```
 
-The only direct dependency is Tokio **1.53.1**, pinned exactly, with default
+The only direct runtime dependency is Tokio **1.53.1**, pinned exactly, with default
 features disabled. Enabled features provide the multithreaded runtime/macros,
 TCP, buffered asynchronous I/O, signals, timers, and `sync` for bounded work and
-one-shot reply channels. Tests add `test-util` for controlled-clock deadlines.
+one-shot reply channels. Tests add `test-util` for controlled-clock deadlines
+and Redis **1.7.1** (exact, default features off, `tokio-comp`) to exercise the
+crawler's actual client library against owned Keyper servers. The Redis crate
+and its locked transitive dependencies are test-only, not a server/proxy backend.
 No Redis installation, sibling repository, Lua toolchain, or local planning
 documents are needed for the basic build/tests.
 
@@ -214,8 +219,65 @@ The read/execute/write loop preserves connection order, including across a
 blocking pop: queued commands cannot unblock their own connection or overtake
 its current command/reply. Separate connections progress independently. EOF
 ends the session, discarding unexecuted input rather than continuing a half-closed
-pipeline. Full pipeline/client-startup verification and transactions remain
-later work; do not infer crawler compatibility from the blocking socket tests.
+pipeline. A pipeline is **not atomic**: its prefix is visible and other clients
+may intervene between its commands. Only each supported command is atomic;
+transactions/scripts are not implemented yet.
+
+### RESP2 client startup and pipelining
+
+Clients may send multiple outstanding requests without waiting for replies.
+Within the connection/resource limits above, each command receives one reply in
+connection order, including command errors; malformed framing instead closes
+the connection after a best-effort protocol error. Binary values, nulls, and
+empty strings keep their RESP2 types.
+The implementation intentionally processes/writes one command at a time, not
+parallel tasks or an unbounded reply queue. Slow readers and blocking pops cause
+**head-of-line blocking on that connection**, including PING and other cloned
+multiplexed handles. Use a separate connection for the producer of a blocked pop;
+a queued push cannot release its own connection. Other connections can progress.
+Pipeline in bounded batches and drain replies; the input/write/work limits above
+still apply. There is no promise of Redis-equivalent pipeline throughput.
+
+The unmodified Redis crate **1.7.1**, with default features disabled and
+`tokio-comp`, works with credential-free `redis://127.0.0.1:6380/0` (default
+RESP2) or `/1` through `/15`. Its normal startup pipeline is:
+
+| Database | Requests, in order |
+| --- | --- |
+| 0 | `CLIENT SETINFO LIB-NAME redis-rs`, `CLIENT SETINFO LIB-VER 1.7.1` |
+| 1–15 | `SELECT index`, then those two metadata requests |
+
+Keyper returns honest unsupported-command errors for **both** CLIENT requests.
+The library consumes/ignores those responses as documented by
+[CLIENT SETINFO](https://redis.io/docs/latest/commands/client-setinfo/), but
+propagates SELECT failures. No metadata-suppression option or fake success is
+needed. Metadata still consumes the startup selection window on DB 0; reconnect
+to choose a database. AUTH, HELLO/RESP3, TLS, and broad CLIENT support are not
+provided. Normal `redis-cli -2` commands work; its `--pipe` bulk-loader mode uses
+unsupported ECHO/leading separators and is not claimed.
+
+The audited external crawler is `K-Planky/swarmcrawl` revision
+`f2c3a591af66e9a424178d9fbc5836740a71e896`. Use its existing
+`--redis-url` / `SWARMCRAWL_REDIS_URL` for the credential-free RESP2 URL, and
+`--namespace` / `SWARMCRAWL_JOB_NAMESPACE` consistently across CLI/nodes. Set
+`SWARMCRAWL_CONFIG_DIR` to an absolute **nonexistent disposable path outside its
+checkout**, so saved deployment metadata cannot interfere. Do not use its
+`cluster` lifecycle commands to manage Keyper or change any crawler files.
+Its connection setup uses `AsyncConnectionConfig::new()` with both
+`set_connection_timeout(None)` and `set_response_timeout(None)`, wrapped in its
+own bounded operation timeout. Our tests exercise that exact setup independently:
+
+```sh
+cargo test --locked --test pipelining
+```
+
+Dropping a caller's Redis-client query future is **not** retracting a dispatched
+request: the multiplexed driver can keep its connection/work alive and drain the
+reply. Later cloned queries remain behind it. No retry or rollback is implied;
+mutations with lost responses remain ambiguous. Actual socket closure follows
+the EOF cancellation policy above. Full crawler commands still need the audited
+extra commands, transactions, and genuine Lua; client compatibility alone does
+not certify crawler jobs.
 
 ## Development checks
 
@@ -248,8 +310,15 @@ with concurrent producers, queued-input ordering, prompt EOF cleanup without
 producers, finite timeout/producer/disconnect races, oversized queued input,
 large unread/lost pop replies, pending shutdown, and empty restart. A test-only
 watch reports actual owner registration counts for synchronization; it does not
-alter replies or execution. Owner tests inspect all cleanup indexes and verify
-cancellation notification without any subsequent commands. Owner tests also
+alter replies or execution. Pipeline tests cover coalesced/bytewise/uneven
+requests, mixed reply types and errors, fatal framing with an unapplied suffix,
+large replies with queued input, non-atomic cross-client interleaving, and
+blocking/error/partial-frame resumption. The actual Redis client tests cover all
+sixteen startup databases, rejected selection, 32 concurrent clones, failing
+pipelines that still apply their suffix, and cancellation without reply
+misrouting. Overflow/EOF/shutdown checks include queued mutations that must not
+self-release a blocked connection. Owner tests inspect all cleanup indexes and
+verify cancellation notification without any subsequent commands. Owner tests also
 exercise asynchronous backpressure, lost replies, and fail-stop panic supervision.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
@@ -270,6 +339,7 @@ certification of future batch behavior or crawler compatibility.
 - `src/server/tests.rs`, `src/server/blocking_tests.rs`: transport/failure and real-socket blocking checks.
 - `src/main.rs`: arguments, two-worker Tokio entry point, signals, diagnostics.
 - `tests/cli.rs`, `tests/transport.rs`, `tests/databases.rs`: process/socket checks.
+- `tests/pipelining.rs`: raw pipelines and actual Redis 1.7.1 startup/multiplexing.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -376,12 +446,12 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: complete ordered-pipeline and actual Redis-client startup/multiplexing
-verification. Actual atomic-batch integration remains unimplemented/unverified.
+Next: the audited numeric/set commands, followed by hash and remaining list/key
+commands. Actual atomic-batch integration remains unimplemented/unverified.
 
-Later work includes ordered pipelining, audited extra commands, genuine Lua 5.1,
-and MULTI/EXEC/DISCARD for an **unmodified** external crawler. Crawler sources and
-Git state must not be changed; compatibility code and harnesses belong here.
+Later work includes genuine Lua 5.1 and MULTI/EXEC/DISCARD for an **unmodified**
+external crawler. Crawler sources and Git state must not be changed;
+compatibility code and harnesses belong here.
 Neither crawler interoperability nor any live demo has been verified. Broad
 Redis compatibility, RESP3, authentication, pub/sub, and public-network hardening
 are not claimed.

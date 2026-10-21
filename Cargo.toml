@@ -10,6 +10,7 @@ description = "A small, in-memory Redis-compatible service built with Rust and T
 tokio = { version = "=1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time", "sync"] }
 
 [dev-dependencies]
+redis = { version = "=1.7.1", default-features = false, features = ["tokio-comp"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["test-util"] }
 
 [lints.rust]
