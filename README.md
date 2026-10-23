@@ -11,7 +11,9 @@ dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
 Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
 are verified, as are isolated transactions and the crawler's six-read snapshot
-composition. Lua/EVAL and full crawler interoperability remain unimplemented.
+composition. A genuine sandboxed Lua 5.1 **library boundary** is tested separately;
+**TCP EVAL/database integration and full crawler interoperability are not yet
+implemented**.
 
 ## Prerequisites and build
 
@@ -22,7 +24,10 @@ Install Rust **1.99.0**, including rustfmt and Clippy, with
 rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
 ```
 
-A platform linker is also required (for example, the system C toolchain on Linux).
+A native C compiler, archiver, and platform linker are also required (for example,
+`build-essential` on Debian/Ubuntu or Xcode command-line tools on macOS). Cargo
+builds and statically links genuine Lua **5.1.5** from the locked `lua-src` crate;
+no system Lua installation is used. Linux x86_64 is the verified build target.
 The checked-in `rust-toolchain.toml` selects this toolchain automatically.
 `Cargo.lock` is tracked; use `--locked` to avoid unintended dependency updates.
 The first build needs crates.io access unless the locked dependencies are cached.
@@ -32,15 +37,19 @@ cargo build --locked
 cargo run --locked -- --help
 ```
 
-The only direct runtime dependency is Tokio **1.53.1**, pinned exactly, with default
-features disabled. Enabled features provide the multithreaded runtime/macros,
+Direct runtime dependencies are Tokio **1.53.1** and mlua **0.12.2**, pinned
+exactly with default features disabled. mlua enables only `lua51` and `vendored`;
+it provides the synchronous Lua boundary, not a Redis backend. Tokio's enabled
+features provide the multithreaded runtime/macros,
 TCP, buffered asynchronous I/O, signals, timers, and `sync` for bounded work and
-one-shot reply channels. Tests add `test-util` for controlled-clock deadlines
+one-shot reply channels. The lock also includes mlua's native build helpers
+(including `luajit-src`), but the selected runtime is Lua 5.1, not LuaJIT.
+Tests add `test-util` for controlled-clock deadlines
 and Redis **1.7.1** (exact, default features off, `tokio-comp`) to exercise the
 crawler's actual client library against owned Keyper servers. The Redis crate
 and its locked transitive dependencies are test-only, not a server/proxy backend.
-No Redis installation, sibling repository, Lua toolchain, or local planning
-documents are needed for the basic build/tests.
+No Redis installation, sibling repository, separate Lua interpreter/development
+package, or local planning documents are needed for the basic build/tests.
 
 ## Start the server and talk to it
 
@@ -443,6 +452,63 @@ mutations with lost responses remain ambiguous. Actual socket closure follows
 the EOF cancellation policy above. Full crawler commands still need EVAL with
 genuine Lua; client/transaction compatibility alone does not certify crawler jobs.
 
+## Lua language boundary (not yet TCP EVAL)
+
+`keyper::scripting::execute(source, keys, args, command)` is a synchronous,
+callback-based library boundary using mlua **0.12.2** and genuine Lua **5.1.5**.
+It does not parse known script patterns, dispatch script hashes, proxy to Redis,
+or provide a database implementation. The TCP server still rejects EVAL. The
+next integration step must call this boundary on the dedicated state owner,
+reuse its command semantics, retain ownership for the whole script, and defer
+waiter service until the enclosing EVAL/EXEC finishes. No async/network/blocking
+wait belongs in the callback. Runtime tests use explicit test-double replies;
+they do not certify database atomicity, script shutdown, or crawler execution.
+
+- Each invocation creates and drops its own VM, with fresh binary-safe indexed
+  KEYS/ARGV. There is no cache or cross-request Lua state. This favors a simple
+  isolation argument over VM reuse/performance that has not been required.
+- Allowed libraries are base language functions, `string`, `table`, and `math`:
+  closures, loops, `ipairs`, `unpack` (including ranges), patterns, formatting,
+  concatenation, and digit arithmetic work normally. Direct global assignment
+  and undefined global reads fail; library/argument table mutations are local to
+  that invocation and cannot survive even an error.
+- No filesystem, processes, network, host printing, debug, package/module loader,
+  environment-changing functions, `rawset`, or binary chunks are
+  exposed. `load`/`loadstring`, `string.dump`, coroutines, and `math.random`/
+  `randomseed` are omitted. Lua 5.1's PRNG would otherwise affect process-global
+  C state. Redis extensions such as cjson/cmsgpack/struct/bit, script flags,
+  caching, replication helpers, and SCRIPT KILL are outside this boundary.
+- `redis.call` raises command errors; `redis.pcall` returns `{err=...}`. Language
+  `pcall` returns an error string for those errors, while `xpcall` can inspect the
+  error table, matching Redis 7.4. `redis.status_reply` and `redis.error_reply`
+  construct the corresponding tables. These are general conversions, not fixed
+  crawler replies. Ordinary errors do not undo callback effects. Rust callback
+  panics **cannot** be swallowed by any of the protected-call functions.
+- RESP2 bulks stay byte strings; integers become Lua doubles; null bulk/array
+  becomes false; status/error becomes `.ok`/`.err`; arrays nest. Returning Lua
+  strings/numbers/true/false/nil gives bulk/integer/1/null/null. Numeric fractions
+  truncate; indexed tables end at the first nil and ignore associative fields;
+  `.err`/`.ok` string fields take precedence. Functions become null. Nonfinite or
+  out-of-i64 numeric returns become i64::MIN, matching Redis 7.4/x86_64; keep such
+  data as strings instead. Status/error
+  lines truncate at NUL and sanitize CR/LF; bulk data is never sanitized.
+- Whole counters must remain **decimal byte strings**, not pass through doubles.
+  Exact IDs beyond 2^53 use INCR followed by GET; individual-digit arithmetic can
+  preserve u64 totals. Number arguments use Redis's conservative integer range
+  and fpconv rounding/notation, not Lua `tostring` or Rust Display. The small
+  safe-Rust adaptation in `src/scripting/fpconv.rs` retains the upstream Boost
+  license and source attribution; reference tests found observable differences
+  with both Rust Display and the separate dtoa crate (not adopted).
+- Conversion is limited to **128 levels / 1,048,576 nodes** in each direction;
+  cycles and excessive replies error instead of overflowing Rust's stack.
+  These are not byte or heap quotas. There is no script instruction/time/memory
+  quota, preemption, or rollback. Nonterminating scripts can stall their caller;
+  later server integration needs the documented fail-stop shutdown deadline.
+  This trusted-local subset is **not** a hostile-code sandbox or public service.
+
+Self-contained runtime checks: `cargo test --locked --test lua_runtime`. Numeric
+unit checks also cover all binary exponents and 100,000 seeded bit patterns.
+
 ## Development checks
 
 Run all four gates after code changes:
@@ -512,7 +578,7 @@ Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
 Repeated schedules supplement the ownership argument below, not a proof or
-certification of future Lua behavior or full crawler compatibility.
+certification of EVAL/database integration or full crawler compatibility.
 
 ### Optional numeric/set reference comparison
 
@@ -587,11 +653,32 @@ category is normalized. Project-specific selection/queue/key limits are tested
 in Rust, not compared to Redis's different policies. This sequential comparison
 does not replace concurrent checks or verify Lua/full crawler jobs.
 
+### Optional Lua language reference comparison
+
+With an explicitly supplied Redis **7.4.x** server (verified: **7.4.0**):
+
+```sh
+KEYPER_REFERENCE_REDIS_SERVER=/absolute/path/to/redis-server \
+  cargo test --locked --test lua_reference -- --ignored --nocapture
+```
+
+This otherwise-ignored test starts only its own disposable loopback Redis,
+checks its process identity before fixture work, bounds startup and socket I/O,
+and cleans up on failure. Missing tools/mismatches fail, not silently skip. It
+compares **1,222** exact general-language/conversion results (including binary
+values and seeded double arguments) plus four error categories; engine-specific
+stack/source diagnostics are not compared as identical strings. Explicit test
+callbacks supply PING/type/integer/error replies; this is **not** Keyper TCP EVAL
+or the database bridge. Sandbox exclusions/limits are tested locally rather than
+compared with Redis's broader API. No existing Redis or crawler is touched.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
 - `src/resp.rs`: request framing, resource bounds, and RESP2 reply encoding.
 - `src/command.rs`: command admission/form checks, PING, selection and transaction queues.
+- `src/scripting.rs`, `src/scripting/`: isolated Lua boundary, RESP2 conversions,
+  and Redis-compatible numeric formatting; not yet connected to database execution.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
 - `src/state/set.rs`: dense set members with a hash index for constant-time membership/removal.
 - `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
@@ -754,8 +841,8 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: a genuine sandboxed Lua 5.1 runtime, then EVAL integration and exact script
-checks. Transactions and the six-read snapshot are implemented; they do not
+Next: connect the tested Lua 5.1 boundary to atomic owner-side EVAL execution,
+then verify the exact unchanged scripts. Transactions and the six-read snapshot are implemented; they do not
 substitute for the crawler's script-wide atomic transitions.
 
 Later work includes full-process verification of the

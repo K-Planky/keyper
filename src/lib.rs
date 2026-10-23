@@ -6,5 +6,6 @@
 mod command;
 pub mod config;
 pub mod resp;
+pub mod scripting;
 pub mod server;
 mod state;
