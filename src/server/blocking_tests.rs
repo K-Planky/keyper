@@ -142,6 +142,72 @@ fn ok() -> Reply {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_defers_waiters_until_final_state_and_rechecks_key_priority() {
+    let mut server = TestServer::start().await;
+    let mut first = server.connect().await;
+    let mut second = server.connect().await;
+    let mut transient = server.connect().await;
+    let mut replaced = server.connect().await;
+    let mut writer = server.connect().await;
+    send(&mut first, &[b"BLPOP", b"a", b"b", b"a", b"0"]).await;
+    server.count(1).await;
+    send(&mut second, &[b"BRPOP", b"a", b"b", b"0"]).await;
+    server.count(2).await;
+    send(&mut transient, &[b"BLPOP", b"transient", b"0"]).await;
+    server.count(3).await;
+    send(&mut replaced, &[b"BLPOP", b"replaced", b"0"]).await;
+    server.count(4).await;
+    assert_eq!(call(&mut writer, &[b"MULTI"]).await, ok());
+    for args in [
+        vec![b"RPUSH".as_slice(), b"transient", b"gone"],
+        vec![b"BLPOP", b"transient", b"0"],
+        vec![b"RPUSH", b"replaced", b"gone"],
+        vec![b"SET", b"replaced", b"string"],
+        vec![b"RPUSH", b"b", b"b1", b"b2"],
+        vec![b"LPUSH", b"a", b"a1"],
+        vec![b"LLEN", b"a"],
+        vec![b"INCR", b"replaced"],
+        vec![b"LLEN", b"b"],
+    ] {
+        assert_eq!(
+            call(&mut writer, &args).await,
+            Reply::Simple(b"QUEUED".to_vec())
+        );
+    }
+    assert_eq!(
+        call(&mut writer, &[b"EXEC"]).await,
+        Reply::Array(Some(vec![
+            Reply::Integer(1),
+            pair(b"transient", b"gone"),
+            Reply::Integer(1),
+            ok(),
+            Reply::Integer(2),
+            Reply::Integer(1),
+            Reply::Integer(1),
+            Reply::Error(b"ERR value is not an integer or out of range".to_vec()),
+            Reply::Integer(2),
+        ]))
+    );
+    assert_eq!(receive(&mut first).await, pair(b"a", b"a1"));
+    assert_eq!(receive(&mut second).await, pair(b"b", b"b2"));
+    server.count(2).await;
+    assert_eq!(
+        call(&mut writer, &[b"LPOP", b"b"]).await,
+        Reply::Bulk(Some(b"b1".to_vec()))
+    );
+    // No intermediate push is handed out, nor does SET alone terminate a wait.
+    assert_eq!(
+        call(&mut writer, &[b"RPUSH", b"transient", b"later"]).await,
+        Reply::Integer(1)
+    );
+    assert_eq!(receive(&mut transient).await, pair(b"transient", b"later"));
+    server.count(1).await;
+    drop(replaced);
+    server.count(0).await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_pops_preserve_end_key_type_and_binary_priority() {
     let mut server = TestServer::start().await;
     let mut client = server.connect().await;

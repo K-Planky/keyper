@@ -56,12 +56,13 @@ fn help_succeeds_and_describes_the_actual_boundary() {
     assert!(help.contains("default: 6379"));
     assert!(
         help.contains(
-            "RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,\nINCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,\nHSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS,\nTYPE, LLEN, LINDEX, LPOP (with optional count) on 127.0.0.1"
+            "RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,\nINCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,\nHSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS,\nTYPE, LLEN, LINDEX, LPOP (with optional count), MULTI, EXEC, DISCARD on 127.0.0.1"
         )
     );
     assert!(help.contains("SELECT is first-command-only; SET has no options"));
+    assert!(help.contains("Transactions execute atomically, without rollback"));
     assert!(help.contains("blocking pops accept 1–5 keys"));
-    assert!(help.contains("Transactions, Lua, and other Redis commands are not implemented yet"));
+    assert!(help.contains("Lua and other Redis commands are not implemented yet"));
 }
 
 #[test]

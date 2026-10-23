@@ -39,7 +39,7 @@ fn send(
     owner.process(
         Work {
             database: db,
-            command,
+            command: Operation::Single(command),
             reply,
         },
         now,
@@ -761,7 +761,7 @@ async fn enqueue(client: &Client, command: DatabaseCommand) -> oneshot::Receiver
         LIMIT,
         client.work.send(Work {
             database: DB,
-            command,
+            command: Operation::Single(command),
             reply,
         }),
     )

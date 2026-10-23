@@ -112,7 +112,7 @@ pub async fn read_request<R: AsyncBufRead + Unpin>(
     Ok(Some(args))
 }
 
-/// All RESP2 reply types, including nested arrays for future EXEC/EVAL results.
+/// All RESP2 reply types, including nested EXEC arrays (and future EVAL results).
 /// Null and empty bulk strings/arrays remain distinct.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Reply {

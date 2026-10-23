@@ -8,7 +8,7 @@ use std::thread;
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::command::{DatabaseCommand, ListEnd, parse_integer};
+use crate::command::{DatabaseCommand, ListEnd, QueuedCommand, parse_integer};
 use crate::resp::Reply;
 
 mod blocking;
@@ -314,9 +314,14 @@ impl Databases {
     }
 }
 
+enum Operation {
+    Single(DatabaseCommand),
+    Transaction(Vec<QueuedCommand>),
+}
+
 struct Work {
     database: DatabaseIndex,
-    command: DatabaseCommand,
+    command: Operation,
     reply: oneshot::Sender<Reply>,
 }
 
@@ -349,6 +354,19 @@ impl Client {
         database: DatabaseIndex,
         command: DatabaseCommand,
     ) -> io::Result<Reply> {
+        self.submit(database, Operation::Single(command)).await
+    }
+
+    pub(crate) async fn transaction(
+        &self,
+        database: DatabaseIndex,
+        commands: Vec<QueuedCommand>,
+    ) -> io::Result<Reply> {
+        self.submit(database, Operation::Transaction(commands))
+            .await
+    }
+
+    async fn submit(&self, database: DatabaseIndex, command: Operation) -> io::Result<Reply> {
         let (reply, receive) = oneshot::channel();
         let mut pending = PendingReply {
             receive,
@@ -614,7 +632,7 @@ mod tests {
                     .work
                     .try_send(Work {
                         database: DatabaseIndex::default(),
-                        command: DatabaseCommand::Get(vec![]),
+                        command: Operation::Single(DatabaseCommand::Get(vec![])),
                         reply,
                     })
                     .is_ok()
@@ -658,7 +676,7 @@ mod tests {
                         .work
                         .try_send(Work {
                             database: DatabaseIndex::default(),
-                            command: DatabaseCommand::Get(vec![]),
+                            command: Operation::Single(DatabaseCommand::Get(vec![])),
                             reply,
                         })
                         .ok()
@@ -704,6 +722,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_exec_before_admission_or_owner_start_skips_the_entire_batch() {
+        for full_queue in [false, true] {
+            let (release, gate) = oneshot::channel();
+            let (client, done) = spawn_with(move |work, canceled| {
+                gate.blocking_recv().unwrap();
+                run(work, canceled)
+            })
+            .unwrap();
+            let mut replies = Vec::new();
+            if full_queue {
+                for _ in 0..WORK_CAPACITY {
+                    let (reply, receive) = oneshot::channel();
+                    client
+                        .work
+                        .try_send(Work {
+                            database: DatabaseIndex::default(),
+                            command: Operation::Single(DatabaseCommand::Get(vec![])),
+                            reply,
+                        })
+                        .ok()
+                        .unwrap();
+                    replies.push(receive);
+                }
+            }
+            let commands = (0..3)
+                .map(|_| QueuedCommand::Database(DatabaseCommand::Increment(b"skipped".to_vec())))
+                .collect();
+            let mut execution = Box::pin(client.transaction(DatabaseIndex::default(), commands));
+            tokio::select! {
+                biased;
+                result = &mut execution => panic!("owner gate did not hold: {result:?}"),
+                _ = tokio::task::yield_now() => (),
+            }
+            assert_eq!(
+                client.work.capacity(),
+                if full_queue { 0 } else { WORK_CAPACITY - 1 }
+            );
+            drop(execution);
+            release.send(()).unwrap();
+            assert_eq!(
+                timeout(
+                    LIMIT,
+                    client.execute(
+                        DatabaseIndex::default(),
+                        DatabaseCommand::Get(b"skipped".to_vec())
+                    )
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                Reply::Bulk(None)
+            );
+            drop(replies);
+            drop(client);
+            timeout(LIMIT, done).await.unwrap().unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_reply_before_execution_skips_work_and_after_execution_keeps_writes() {
         // Queue before starting the owner: deterministic cancellation, no sleep.
         let (send, receive) = mpsc::channel(WORK_CAPACITY);
@@ -711,10 +788,10 @@ mod tests {
         let (reply, canceled) = oneshot::channel();
         send.send(Work {
             database: db,
-            command: DatabaseCommand::Set {
+            command: Operation::Single(DatabaseCommand::Set {
                 key: b"key".to_vec(),
                 value: b"skipped".to_vec(),
-            },
+            }),
             reply,
         })
         .await
@@ -723,10 +800,10 @@ mod tests {
         let (reply, applied) = oneshot::channel();
         send.send(Work {
             database: db,
-            command: DatabaseCommand::Set {
+            command: Operation::Single(DatabaseCommand::Set {
                 key: b"other".to_vec(),
                 value: b"kept".to_vec(),
-            },
+            }),
             reply,
         })
         .await
@@ -734,7 +811,7 @@ mod tests {
         let (reply, skipped_value) = oneshot::channel();
         send.send(Work {
             database: db,
-            command: DatabaseCommand::Get(b"key".to_vec()),
+            command: Operation::Single(DatabaseCommand::Get(b"key".to_vec())),
             reply,
         })
         .await
@@ -742,7 +819,7 @@ mod tests {
         let (reply, kept_value) = oneshot::channel();
         send.send(Work {
             database: db,
-            command: DatabaseCommand::Get(b"other".to_vec()),
+            command: Operation::Single(DatabaseCommand::Get(b"other".to_vec())),
             reply,
         })
         .await
@@ -766,7 +843,7 @@ mod tests {
         let (reply, after_loss) = oneshot::channel();
         send.send(Work {
             database: db,
-            command: DatabaseCommand::Get(b"other".to_vec()),
+            command: Operation::Single(DatabaseCommand::Get(b"other".to_vec())),
             reply,
         })
         .await

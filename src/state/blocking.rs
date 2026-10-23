@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
-use super::{DATABASES, DatabaseIndex, Databases, Value, Work, wrong_type};
-use crate::command::{DatabaseCommand, ListEnd};
+use super::{DATABASES, DatabaseIndex, Databases, Operation, Value, Work, wrong_type};
+use crate::command::{DatabaseCommand, ListEnd, QueuedCommand};
 use crate::resp::Reply;
 
 #[cfg(test)]
@@ -179,37 +179,70 @@ impl Owner {
         if reply.is_closed() {
             return;
         }
-        if let DatabaseCommand::Pop { end, keys, timeout } = command {
-            let pop = match Pop::new(end, keys, &timeout, now) {
-                Ok(pop) => pop,
-                Err(error) => {
-                    let _ = reply.send(error);
-                    return;
-                }
-            };
-            if let Some(result) = self.databases.pop(database, &pop) {
-                let _ = reply.send(result);
-            } else {
-                self.register(Waiter {
-                    database,
-                    pop,
-                    reply,
-                });
+        match command {
+            Operation::Transaction(commands) => {
+                let mut ready = Vec::new();
+                let results = commands
+                    .into_iter()
+                    .map(|command| match command {
+                        QueuedCommand::Reply(reply) => reply,
+                        QueuedCommand::Database(command) => {
+                            self.execute_atomic(database, command, &mut ready)
+                        }
+                    })
+                    .collect();
+                // All replies describe the isolated batch, never subsequent waiter
+                // consumption. Runtime errors are array entries, not rollback/exit.
+                let _ = reply.send(Reply::Array(Some(results)));
+                self.serve_ready(database, &ready);
             }
-        } else {
-            let ready = match &command {
-                DatabaseCommand::Push { key, .. } => Some(key.clone()),
-                _ => None,
-            };
-            let result = self.databases.execute(database, command);
-            let ready = ready.filter(|_| matches!(result, Reply::Integer(_)));
-            // Capture the complete unit's reply before subsequent waiter pops.
-            // Failed delivery cannot undo a push or suppress waiter service.
-            let _ = reply.send(result);
-            if let Some(key) = ready {
-                self.serve_ready(database, &[key]);
+            Operation::Single(DatabaseCommand::Pop { end, keys, timeout }) => {
+                let pop = match Pop::new(end, keys, &timeout, now) {
+                    Ok(pop) => pop,
+                    Err(error) => {
+                        let _ = reply.send(error);
+                        return;
+                    }
+                };
+                if let Some(result) = self.databases.pop(database, &pop) {
+                    let _ = reply.send(result);
+                } else {
+                    self.register(Waiter {
+                        database,
+                        pop,
+                        reply,
+                    });
+                }
+            }
+            Operation::Single(command) => {
+                let mut ready = Vec::new();
+                let result = self.execute_atomic(database, command, &mut ready);
+                // Failed delivery cannot undo a push or suppress waiter service.
+                let _ = reply.send(result);
+                self.serve_ready(database, &ready);
             }
         }
+    }
+
+    fn execute_atomic(
+        &mut self,
+        database: DatabaseIndex,
+        command: DatabaseCommand,
+        ready: &mut Vec<Vec<u8>>,
+    ) -> Reply {
+        let pushed_key = match &command {
+            DatabaseCommand::Push { key, .. } => Some(key.clone()),
+            _ => None,
+        };
+        // Databases::execute never registers waits. Batch blocking pops make
+        // one immediate attempt and return null if no item is available.
+        let result = self.databases.execute(database, command);
+        if let Some(key) = pushed_key
+            && matches!(result, Reply::Integer(_))
+        {
+            ready.push(key);
+        }
+        result
     }
 
     fn register(&mut self, waiter: Waiter) {

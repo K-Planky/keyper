@@ -116,7 +116,7 @@ def corpus():
 
 
 def compare(corpus_factory, normalize, description):
-    """Shared owned-endpoint runner for the numeric/set and hash corpora."""
+    """Shared owned-endpoint runner; each corpus documents its normalization."""
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--keyper", default="target/debug/keyper")
     parser.add_argument("--redis-server", required=True)
@@ -171,7 +171,7 @@ def compare(corpus_factory, normalize, description):
                 ]
                 assert replies[0] == replies[1], f"comparison {count}, command {args[0]!r}: {replies!r}"
                 count += 1
-    print(f"PASS: {count} commands match reference Redis (only unordered collections normalized)")
+    print(f"PASS: {count} commands match reference Redis")
 
 
 def normalize(args, reply):

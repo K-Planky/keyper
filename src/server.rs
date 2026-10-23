@@ -133,6 +133,15 @@ async fn connection(stream: TcpStream, state: state::Client) -> io::Result<()> {
             Ok(Some(request)) => {
                 let reply = match session.prepare(request) {
                     Action::Reply(reply) => reply,
+                    Action::Transaction(database, commands) => {
+                        let Some(reply) =
+                            while_connected(&mut input, state.transaction(database, commands))
+                                .await?
+                        else {
+                            return Ok(());
+                        };
+                        reply
+                    }
                     Action::Database(database, command) => {
                         let Some(reply) =
                             while_connected(&mut input, state.execute(database, command)).await?

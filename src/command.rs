@@ -1,4 +1,4 @@
-//! Command admission and connection-local selection, separate from wire/state I/O.
+//! Command admission, connection-local selection and transaction queues.
 
 use crate::resp::{Reply, Request};
 use crate::state::DatabaseIndex;
@@ -77,17 +77,68 @@ pub(crate) enum DatabaseCommand {
 enum Command {
     Ping(Option<Vec<u8>>),
     Select(Vec<u8>),
+    Multi,
+    Exec,
+    Discard,
+    RuntimeError(Reply),
+    Database(DatabaseCommand),
+}
+
+/// Pure replies (PING, rejected late SELECT, form errors) still occupy a slot
+/// in EXEC. No command in this queue has executed against the database yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QueuedCommand {
+    Reply(Reply),
     Database(DatabaseCommand),
 }
 
 pub(crate) enum Action {
     Reply(Reply),
     Database(DatabaseIndex, DatabaseCommand),
+    Transaction(DatabaseIndex, Vec<QueuedCommand>),
+}
+
+const MAX_TRANSACTION_COMMANDS: usize = 1024;
+const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct Transaction {
+    commands: Vec<QueuedCommand>,
+    bytes: usize,
+    dirty: bool,
+}
+
+impl Transaction {
+    fn dirty(&mut self) {
+        self.dirty = true;
+        // EXEC can never run this queue. Reclaim retained payloads immediately.
+        self.commands.clear();
+        self.bytes = 0;
+    }
+
+    fn queue(&mut self, command: QueuedCommand, bytes: usize) -> Reply {
+        if !self.dirty {
+            if self.commands.len() == MAX_TRANSACTION_COMMANDS
+                || bytes > MAX_TRANSACTION_BYTES - self.bytes
+            {
+                self.dirty();
+                return Reply::Error(b"ERR transaction queue limit exceeded".to_vec());
+            }
+            self.bytes += bytes;
+            self.commands.push(command);
+        }
+        Reply::Simple(b"QUEUED".to_vec())
+    }
+}
+
+fn late_select() -> Reply {
+    Reply::Error(b"ERR SELECT is only allowed as the first command".to_vec())
 }
 
 pub(crate) struct Session {
     database: DatabaseIndex,
     first_command: bool,
+    transaction: Option<Transaction>,
 }
 
 impl Default for Session {
@@ -95,6 +146,7 @@ impl Default for Session {
         Self {
             database: DatabaseIndex::default(),
             first_command: true,
+            transaction: None,
         }
     }
 }
@@ -104,21 +156,78 @@ impl Session {
         // Even an invalid/unknown/empty command consumes the selection window.
         // Framing only calls us once the entire request has been decoded.
         let first = std::mem::replace(&mut self.first_command, false);
-        let reply = match parse(request) {
-            Ok(Command::Select(index)) if first => match parse_database(&index) {
+        // Charge payload plus conservative per-argument framing/storage overhead;
+        // empty arguments must not evade the byte bound. Wire frames are bounded.
+        let bytes = request.iter().map(|arg| arg.len() + 32).sum::<usize>();
+        let is_exec = request
+            .first()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"EXEC"));
+        let command = match parse(request) {
+            Ok(command) => command,
+            Err(_) if is_exec => {
+                // Redis treats a rejected EXEC specially: even arity errors
+                // exit MULTI immediately, including when already dirty.
+                self.transaction = None;
+                return Action::Reply(Reply::Error(
+                    b"EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command".to_vec(),
+                ));
+            }
+            Err(error) => {
+                if let Some(transaction) = &mut self.transaction {
+                    transaction.dirty();
+                }
+                return Action::Reply(error);
+            }
+        };
+        let reply = match command {
+            Command::Multi => {
+                if self.transaction.is_some() {
+                    // Nested MULTI is an immediate error, but does not dirty or
+                    // replace the original queue (unlike wrong-arity MULTI).
+                    Reply::Error(b"ERR MULTI calls can not be nested".to_vec())
+                } else {
+                    self.transaction = Some(Transaction::default());
+                    Reply::Simple(b"OK".to_vec())
+                }
+            }
+            Command::Exec => match self.transaction.take() {
+                None => Reply::Error(b"ERR EXEC without MULTI".to_vec()),
+                Some(transaction) if transaction.dirty => Reply::Error(
+                    b"EXECABORT Transaction discarded because of previous errors.".to_vec(),
+                ),
+                Some(transaction) => {
+                    return Action::Transaction(self.database, transaction.commands);
+                }
+            },
+            Command::Discard => match self.transaction.take() {
+                None => Reply::Error(b"ERR DISCARD without MULTI".to_vec()),
+                Some(_) => Reply::Simple(b"OK".to_vec()),
+            },
+            command if self.transaction.is_some() => {
+                let queued = match command {
+                    Command::Ping(None) => QueuedCommand::Reply(Reply::Simple(b"PONG".to_vec())),
+                    Command::Ping(Some(message)) => {
+                        QueuedCommand::Reply(Reply::Bulk(Some(message)))
+                    }
+                    Command::Select(_) => QueuedCommand::Reply(late_select()),
+                    Command::RuntimeError(error) => QueuedCommand::Reply(error),
+                    Command::Database(command) => QueuedCommand::Database(command),
+                    _ => unreachable!("transaction control handled above"),
+                };
+                self.transaction.as_mut().unwrap().queue(queued, bytes)
+            }
+            Command::Select(index) if first => match parse_database(&index) {
                 Ok(database) => {
                     self.database = database;
                     Reply::Simple(b"OK".to_vec())
                 }
                 Err(error) => error,
             },
-            Ok(Command::Select(_)) => {
-                Reply::Error(b"ERR SELECT is only allowed as the first command".to_vec())
-            }
-            Ok(Command::Ping(None)) => Reply::Simple(b"PONG".to_vec()),
-            Ok(Command::Ping(Some(message))) => Reply::Bulk(Some(message)),
-            Ok(Command::Database(command)) => return Action::Database(self.database, command),
-            Err(error) => error,
+            Command::Select(_) => late_select(),
+            Command::RuntimeError(error) => error,
+            Command::Ping(None) => Reply::Simple(b"PONG".to_vec()),
+            Command::Ping(Some(message)) => Reply::Bulk(Some(message)),
+            Command::Database(command) => return Action::Database(self.database, command),
         };
         Action::Reply(reply)
     }
@@ -128,16 +237,33 @@ fn wrong_arity(command: &str) -> Reply {
     Reply::Error(format!("ERR wrong number of arguments for '{command}' command").into_bytes())
 }
 
-// Validate arity before taking arguments. Value conversion stays separate so
-// later transaction admission need not confuse execution-time errors with arity.
+// Validate Redis's admission arity before taking arguments. Some variable-arity
+// commands check their supported form only at execution (even when the error
+// text says wrong arity): keep those errors in the EXEC array, not EXECABORT.
+// Numeric/type conversion likewise remains execution-time work.
 fn parse(request: Request) -> Result<Command, Reply> {
     let mut args = request.into_iter();
     let Some(name) = args.next() else {
         return Err(Reply::Error(b"ERR empty command".to_vec()));
     };
-    if name.eq_ignore_ascii_case(b"PING") {
+    if name.eq_ignore_ascii_case(b"MULTI")
+        || name.eq_ignore_ascii_case(b"EXEC")
+        || name.eq_ignore_ascii_case(b"DISCARD")
+    {
+        let (command, label) = if name.eq_ignore_ascii_case(b"MULTI") {
+            (Command::Multi, "multi")
+        } else if name.eq_ignore_ascii_case(b"EXEC") {
+            (Command::Exec, "exec")
+        } else {
+            (Command::Discard, "discard")
+        };
+        if args.len() != 0 {
+            return Err(wrong_arity(label));
+        }
+        Ok(command)
+    } else if name.eq_ignore_ascii_case(b"PING") {
         if args.len() > 1 {
-            return Err(wrong_arity("ping"));
+            return Ok(Command::RuntimeError(wrong_arity("ping")));
         }
         Ok(Command::Ping(args.next()))
     } else if name.eq_ignore_ascii_case(b"SELECT") {
@@ -185,8 +311,11 @@ fn parse(request: Request) -> Result<Command, Reply> {
             index: args.next().unwrap(),
         }))
     } else if name.eq_ignore_ascii_case(b"LPOP") {
-        if !(1..=2).contains(&args.len()) {
+        if args.len() == 0 {
             return Err(wrong_arity("lpop"));
+        }
+        if args.len() > 2 {
+            return Ok(Command::RuntimeError(wrong_arity("lpop")));
         }
         Ok(Command::Database(DatabaseCommand::ListPop {
             key: args.next().unwrap(),
@@ -231,8 +360,11 @@ fn parse(request: Request) -> Result<Command, Reply> {
             DatabaseCommand::SetMembers(key)
         }))
     } else if name.eq_ignore_ascii_case(b"HSET") {
-        if args.len() < 3 || args.len() % 2 != 1 {
+        if args.len() < 3 {
             return Err(wrong_arity("hset"));
+        }
+        if args.len() % 2 != 1 {
+            return Ok(Command::RuntimeError(wrong_arity("hset")));
         }
         let key = args.next().unwrap();
         let mut pairs = Vec::with_capacity(args.len() / 2);
@@ -363,7 +495,10 @@ mod tests {
                 let mut args = vec![name];
                 args.resize(count + 1, b"\0\xff");
                 let valid = count == required || (name == b"lPoP" && count == 2);
-                assert_eq!(parse(request(&args)).is_ok(), valid);
+                assert_eq!(
+                    matches!(parse(request(&args)), Ok(Command::Database(_))),
+                    valid
+                );
             }
         }
         assert_eq!(
@@ -408,7 +543,6 @@ mod tests {
             vec![],
             vec![&b"UNKNOWN\r\n"[..]],
             vec![b""],
-            vec![b"PING", b"", b""],
             vec![b"SELECT"],
             vec![b"SELECT", b"0", b"1"],
             vec![b"GET"],
@@ -571,7 +705,11 @@ mod tests {
                 };
                 let mut args = vec![name];
                 args.extend(vec![&b""[..]; count]);
-                assert_eq!(parse(request(&args)).is_ok(), valid, "{name:?}, {count}");
+                assert_eq!(
+                    matches!(parse(request(&args)), Ok(Command::Database(_))),
+                    valid,
+                    "{name:?}, {count}"
+                );
             }
         }
     }
@@ -661,6 +799,8 @@ mod tests {
             vec![&b"PING"[..]],
             vec![b"PING", b"a", b"b"],
             vec![b"UNKNOWN"],
+            vec![b"EXEC"],
+            vec![b"DISCARD"],
             vec![],
             vec![b"SELECT", b"16"],
             vec![b"SELECT"],

@@ -4,13 +4,14 @@ A small, in-memory Redis-compatible service being built in Rust on Tokio.
 
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
 BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
-HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS, TYPE, LLEN, LINDEX, and LPOP.**
+HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS, TYPE, LLEN, LINDEX, LPOP,
+MULTI, EXEC, and DISCARD (29 commands).**
 Sixteen in-memory databases hold strings, lists, sets, or hashes and belong to one
 dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
 Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
-are verified. Transactions, Lua, and full crawler interoperability are not
-implemented yet.
+are verified, as are isolated transactions and the crawler's six-read snapshot
+composition. Lua/EVAL and full crawler interoperability remain unimplemented.
 
 ## Prerequisites and build
 
@@ -217,6 +218,9 @@ persistence; every explicit restart starts empty.
 | `HLEN key` | Integer field count, or 0 for an absent key |
 | `HGETALL key` | Flat array of alternating bulk-string fields/values; empty array for an absent key; pair order unspecified |
 | `HVALS key` | Unordered bulk-string value array, retaining duplicates; empty array for an absent key |
+| `MULTI` | Simple `OK`; begin a connection-local transaction queue |
+| `EXEC` | Array of queued replies, or EXECABORT for a rejected transaction |
+| `DISCARD` | Simple `OK`; discard the open transaction without execution |
 | `TYPE key` | Simple string `none`, `string`, `list`, `set`, or `hash` |
 | `LLEN key` | Integer list length, or 0 for an absent key |
 | `LINDEX key index` | Bulk string at a zero-based index; negative indices count from the tail; null bulk if absent/out of bounds |
@@ -272,7 +276,7 @@ bytes; decimal counters are never converted to numbers by hash storage. HSET
 and HDEL apply their whole argument list atomically. Each HGETALL or HVALS is
 one indivisible snapshot of that hash, not several independent field reads.
 **Separate commands, even pipelined, are not a coherent multi-key snapshot**;
-the crawler's transaction boundary remains future work. SET replaces hashes;
+use MULTI/EXEC for a coherent multi-key snapshot. SET replaces hashes;
 EXISTS counts them; hash creation/deletion does not wake blocked list pops.
 
 TYPE never creates a key and reports only the types implemented here. LLEN,
@@ -290,6 +294,58 @@ are one atomic operation. List reads and empty LPOP do not wake/reorder blocked
 waiters; existing waiters get their post-push service before a later LPOP runs.
 Separate LINDEX and LPOP calls do **not** form an atomic claim; that requires the
 future script boundary used by the crawler.
+
+### Transactions
+
+`MULTI` starts a connection-local queue, without locking or changing the database.
+Supported commands, including PING, return **QUEUED** until `EXEC` executes them
+in order as one isolated owner operation. EXEC returns an array containing one
+reply per queued command (nested arrays and errors retain their RESP2 types);
+an empty transaction returns an empty array. `DISCARD` drops the queue and exits
+transaction mode. Both EXEC and DISCARD restore normal command processing.
+
+Use **one connection**, for example on the disposable endpoint above:
+
+```sh
+redis-cli -2 -h 127.0.0.1 -p 6380 <<'EOF'
+MULTI
+SET tx-demo 0
+INCR tx-demo
+GET tx-demo
+EXEC
+EOF
+# OK, three QUEUED replies, then the EXEC array [OK, 1, "1"].
+```
+
+- Unknown commands and admission-arity errors dirty the transaction: EXEC returns
+  `EXECABORT` and executes nothing. Bare SET's no-options rule and the five-key
+  pop bound remain admission restrictions. Further valid requests still receive
+  QUEUED, but a dirty queue never runs. DISCARD clears dirty state too.
+- Redis distinguishes admission arity from execution-time form checks: excessive
+  PING/LPOP arguments and an unpaired HSET field after its minimum arguments
+  **queue**, then return errors inside EXEC. Numeric/type errors are likewise
+  deferred. Runtime errors retain earlier writes and **do not skip later commands**.
+  Transactions provide isolation, **not rollback**.
+- Nested MULTI errors immediately without replacing/dirtying the original queue.
+  EXEC/DISCARD without MULTI error. Wrong-arity EXEC is special: it immediately
+  returns `EXECABORT` and discards/exits the transaction, even if already dirty.
+  Wrong-arity MULTI/DISCARD dirty an open transaction instead.
+- SELECT inside MULTI queues a late-selection error; EXEC cannot change the
+  database. MULTI itself consumes the first-command selection opportunity.
+- BLPOP/BRPOP inside EXEC never wait: they immediately pop if possible, otherwise
+  return a null array. Existing blocked clients run **after the entire batch and
+  its reply capture**, rechecking final lists and original key order. A list
+  pushed then emptied/replaced cannot leak intermediate items to a waiter.
+- Disconnect before EXEC drops unexecuted queue contents. Cancellation before
+  owner execution can skip EXEC; once it starts, the entire batch completes even
+  if its reply is lost. This is an ambiguous outcome, never automatic retry or
+  rollback. Shutdown drops queues and drains an already-running owner unit.
+
+The unchanged crawler's `redis::pipe().atomic()` snapshot composition is verified:
+HGETALL(meta), SCARD(seen), LLEN(frontier), HLEN(in-flight), HGETALL(stats),
+HGETALL(extensions), in that order. Actual job execution still requires Lua/EVAL.
+WATCH/CAS, script execution, and persistence are not provided by this boundary.
+See the [official transaction semantics](https://redis.io/docs/latest/develop/using-commands/transactions/).
 
 ### Resource limits and ordering
 
@@ -309,6 +365,12 @@ work; they are not the real Redis server's defaults:
   Exceeding this queue closes the connection without a guaranteed error reply,
   cancels unstarted/pending work, and discards queued commands. This explicit
   overload policy avoids an unbounded buffer or EOF hidden behind a full queue.
+- Each transaction retains at most **1024 commands** and **16 MiB** charged as
+  argument payload bytes plus 32 bytes per argument (including command names).
+  Exceeding either limit returns `ERR transaction queue limit exceeded`, dirties
+  the transaction, and frees its queued payloads; EXEC then returns EXECABORT.
+  These bounds are separate from unread pipelined input. EXEC replies are fully
+  materialized; repeated large reads can still use substantial memory.
 - A shared work channel with **256** queued operations and one one-shot reply
   channel per operation. Full-queue sends await capacity without blocking Tokio.
   Stored database contents have no total size limit or eviction policy.
@@ -323,8 +385,8 @@ blocking pop: queued commands cannot unblock their own connection or overtake
 its current command/reply. Separate connections progress independently. EOF
 ends the session, discarding unexecuted input rather than continuing a half-closed
 pipeline. A pipeline is **not atomic**: its prefix is visible and other clients
-may intervene between its commands. Only each supported command is atomic;
-transactions/scripts are not implemented yet.
+may intervene between its commands. Only explicit MULTI/EXEC batches execute
+atomically as a group; queuing alone does not acquire database ownership.
 
 ### RESP2 client startup and pipelining
 
@@ -379,8 +441,7 @@ request: the multiplexed driver can keep its connection/work alive and drain the
 reply. Later cloned queries remain behind it. No retry or rollback is implied;
 mutations with lost responses remain ambiguous. Actual socket closure follows
 the EOF cancellation policy above. Full crawler commands still need EVAL with
-genuine Lua and transactions; client compatibility alone does not certify
-crawler jobs.
+genuine Lua; client/transaction compatibility alone does not certify crawler jobs.
 
 ## Development checks
 
@@ -440,11 +501,18 @@ values, all sixteen databases, deletion/type transitions, incomplete pop framing
 independent-vector churn, waiter priority, concurrent disjoint counted ranges,
 whole-batch length/head observations, and mixed producer/scalar/counted/blocking
 pop item accounting with real-time fences.
+Transaction tests cover fragmented pipelines/all sixteen DBs, nested reply shapes,
+queue control and limits, admission versus runtime form/numeric/type errors,
+retained writes, nonwaiting batch pops, pre-execution cancellation, discarded and
+truncated queues, unread/lost EXEC replies, and competing EXEC/ordinary increments.
+The actual Redis 1.7.1 atomic pipeline decodes the crawler's six-read snapshot
+while concurrent batches update all six keys. Synchronized blocked-socket checks
+verify final-state service, FIFO/key priority, and no intermediate delivery.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
 Repeated schedules supplement the ownership argument below, not a proof or
-certification of future batch behavior or crawler compatibility.
+certification of future Lua behavior or full crawler compatibility.
 
 ### Optional numeric/set reference comparison
 
@@ -479,7 +547,7 @@ errors, binary/empty fields and values, duplicate updates/deletes, exact decimal
 strings, and deterministic churn. Only HGETALL **pair** order and HVALS/SMEMBERS
 element order are normalized; duplicate values and field/value associations
 must remain intact. The script reuses the numeric/set harness's bounded process
-runner. Neither comparison substitutes for concurrent tests, future transactions,
+runner. Neither comparison substitutes for concurrent tests, transactions,
 Lua, or a full crawler run; missing prerequisites or mismatches exit nonzero.
 
 ### Optional list/key reference comparison
@@ -501,11 +569,29 @@ transactions, scripts, or full crawler jobs. The crawler's original Redis suites
 also require test-only SCAN/DEL/LRANGE/LSET/TTL, which remain unsupported; these
 Keyper-owned checks are not a claim those suites pass on Keyper.
 
+### Optional transaction reference comparison
+
+Using the same Python/Redis prerequisites and owned-endpoint policy:
+
+```sh
+cargo build --locked
+python3 tests/compare_transactions.py --redis-server /absolute/path/to/redis-server
+```
+
+Verified with Redis **7.4.0**: queue/EXEC/DISCARD state transitions, admission and
+runtime errors (including wrong-arity EXEC and variable-arity form checks),
+retained writes, nonwaiting pops, nested/binary replies, and the crawler snapshot
+composition. Replies match exactly except unknown-command diagnostics: Keyper
+intentionally does not reflect potentially sensitive input, so that error's
+category is normalized. Project-specific selection/queue/key limits are tested
+in Rust, not compared to Redis's different policies. This sequential comparison
+does not replace concurrent checks or verify Lua/full crawler jobs.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
 - `src/resp.rs`: request framing, resource bounds, and RESP2 reply encoding.
-- `src/command.rs`: command admission, PING, and connection-local selection.
+- `src/command.rs`: command admission/form checks, PING, selection and transaction queues.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
 - `src/state/set.rs`: dense set members with a hash index for constant-time membership/removal.
 - `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
@@ -526,6 +612,8 @@ Keyper-owned checks are not a claim those suites pass on Keyper.
 - `tests/compare_numeric_sets.py`: opt-in numeric/set comparison and shared owned-endpoint runner.
 - `tests/compare_hashes.py`: opt-in hash comparison with an owned reference Redis.
 - `tests/compare_lists.py`: opt-in exact list/key comparison with an owned reference Redis.
+- `tests/transactions.rs`: raw transaction semantics and actual-client atomic snapshot/concurrency tests.
+- `tests/compare_transactions.py`: opt-in transaction comparison with an owned reference Redis.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -551,8 +639,13 @@ cannot observe a partially updated variadic record, but separate reads can see
 different moments. TYPE, LLEN, and LINDEX linearize at their owner lookup/index
 check; LPOP at its entire removal and any empty-key deletion, never between
 returned elements. Missing/type/numeric errors are indivisible owner decisions
-with no mutation. These are individual operations, not a substitute for future
-script/EXEC atomicity.
+with no mutation. These individual operations alone are not a substitute for
+script/EXEC atomicity. MULTI/QUEUED/DISCARD linearize at connection-local queue
+transitions, not database mutations. EXEC submits one owner unit, with no other
+client operation or waiter consumption between commands; its entire result and
+retained runtime-error writes linearize as that batch. Waiter service follows
+reply capture. Cost is the sum of enclosed work plus replies/readiness service,
+not a copy of the database. MULTI is O(1); DISCARD frees O(queued commands/bytes).
 SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
 touching data. Other clients cannot change a connection's selected database.
@@ -621,8 +714,8 @@ committed state, so variadic LPUSH exposes its final head, never its first
 intermediate insertion. Reentering creates a new FIFO position. Only committed
 nonempty lists trigger service: SET, failed pushes, or a list filled then
 emptied/replaced within one unit do not themselves wake a waiter. The service
-boundary is tested with simulated multi-command units, **not yet EXEC/EVAL**.
-Future batch integration must preserve this rule. If an atomic batch fills b
+boundary is tested with actual EXEC and simulated units; EVAL integration remains
+future work. If an atomic batch fills b
 then a for a waiter on `[a, b]`, the recheck must select a; this project's explicit
 linearizability requirement takes precedence over Redis prose describing
 first-pushed-key priority. No caller may observe a partial atomic batch.
@@ -661,10 +754,11 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: genuine MULTI/EXEC/DISCARD transactions, including the crawler's coherent
-six-read snapshot. Actual atomic-batch integration remains unimplemented/unverified.
+Next: a genuine sandboxed Lua 5.1 runtime, then EVAL integration and exact script
+checks. Transactions and the six-read snapshot are implemented; they do not
+substitute for the crawler's script-wide atomic transitions.
 
-Later work includes genuine Lua 5.1/EVAL and full-process verification of the
+Later work includes full-process verification of the
 **unmodified** external crawler. Crawler sources and Git state must not be changed;
 compatibility code and harnesses belong here.
 Neither crawler interoperability nor any live demo has been verified. Broad
