@@ -115,12 +115,9 @@ def corpus():
     yield [b"INCR", b"set"]
 
 
-def compare(corpus_factory, normalize, description):
-    """Shared owned-endpoint runner; each corpus documents its normalization."""
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--keyper", default="target/debug/keyper")
-    parser.add_argument("--redis-server", required=True)
-    args = parser.parse_args()
+@contextlib.contextmanager
+def owned_endpoints(keyper_binary, redis_binary):
+    """Yield connectable addresses; cleanup touches only these owned processes."""
     with tempfile.TemporaryDirectory(prefix="keyper-command-reference-") as scratch:
         # Redis uses an owned Unix socket, with TCP/persistence disabled. Keyper
         # binds its own OS-assigned loopback port. No existing server is touched.
@@ -128,12 +125,12 @@ def compare(corpus_factory, normalize, description):
         keyper_log = pathlib.Path(scratch) / "keyper.log"
         with contextlib.ExitStack() as stack:
             reference = stack.enter_context(process(
-                [args.redis_server, "--port", "0", "--unixsocket", redis_socket,
+                [redis_binary, "--port", "0", "--unixsocket", redis_socket,
                  "--save", "", "--appendonly", "no", "--dir", scratch],
                 pathlib.Path(scratch) / "redis.log",
             ))
             keyper = stack.enter_context(process(
-                [str(pathlib.Path(args.keyper).resolve()), "--port", "0"], keyper_log,
+                [str(pathlib.Path(keyper_binary).resolve()), "--port", "0"], keyper_log,
             ))
             deadline = time.monotonic() + 10
             while True:
@@ -151,24 +148,38 @@ def compare(corpus_factory, normalize, description):
                         probe.close()
                         raise
                     else:
-                        redis_sock = stack.enter_context(probe)
+                        probe.close()
                         break
                 assert keyper.poll() is None, f"Keyper failed: {line!r}"
                 assert reference.poll() is None, "reference Redis failed at startup"
                 assert time.monotonic() < deadline, f"server startup deadline: {line!r}"
                 time.sleep(0.01)
             host, port = line.rsplit(" ", 1)[1].split(":")
-            keyper_sock = stack.enter_context(
-                socket.create_connection((host, int(port)), timeout=5)
-            )
-            sockets = [keyper_sock, redis_sock]
-            streams = [stack.enter_context(sock.makefile("rb")) for sock in sockets]
+            yield [(socket.AF_INET, (host, int(port))), (socket.AF_UNIX, redis_socket)]
+
+
+@contextlib.contextmanager
+def connection(endpoint):
+    family, address = endpoint
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(address)
+        with sock.makefile("rb") as stream:
+            yield sock, stream
+
+
+def compare(corpus_factory, normalize, description):
+    """Shared owned-endpoint runner; each corpus documents its normalization."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--keyper", default="target/debug/keyper")
+    parser.add_argument("--redis-server", required=True)
+    args = parser.parse_args()
+    with owned_endpoints(args.keyper, args.redis_server) as endpoints:
+        with contextlib.ExitStack() as stack:
+            clients = [stack.enter_context(connection(endpoint)) for endpoint in endpoints]
             count = 0
             for args in corpus_factory():
-                replies = [
-                    normalize(args, command(sock, stream, args))
-                    for sock, stream in zip(sockets, streams)
-                ]
+                replies = [normalize(args, command(*client, args)) for client in clients]
                 assert replies[0] == replies[1], f"comparison {count}, command {args[0]!r}: {replies!r}"
                 count += 1
     print(f"PASS: {count} commands match reference Redis")

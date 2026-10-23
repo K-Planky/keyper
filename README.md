@@ -13,8 +13,8 @@ Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
 are verified, as are isolated transactions and the crawler's six-read snapshot
 composition. Genuine sandboxed Lua 5.1 EVAL executes on that same owner,
 including inside EXEC, with no intermediate database or waiter visibility.
-**The unchanged crawler scripts and full-process interoperability are not yet
-certified.**
+The five unchanged crawler script compositions pass component checks against
+Redis 7.4.0. **Full-process crawler interoperability is not yet certified.**
 
 ## Prerequisites and build
 
@@ -553,8 +553,9 @@ redis-cli -2 -h 127.0.0.1 -p 6380 GET script-kept
 
 Self-contained checks: `cargo test --locked --test lua_runtime` (language) and
 `cargo test --locked --test eval` (real TCP/database bridge). Numeric unit checks
-also cover all binary exponents and 100,000 seeded bit patterns. These general
-scripts do not yet certify the unchanged crawler script compositions or jobs.
+also cover all binary exponents and 100,000 seeded bit patterns. The optional
+unchanged-script component suite below adds crawler-specific verification;
+neither suite certifies actual crawler processes or HTTP behavior.
 
 ## Development checks
 
@@ -634,8 +635,11 @@ including after script errors. On Linux, an owned-process test observes the
 state thread's CPU progress during an infinite script, disconnects its client,
 checks independent PING, and verifies fatal five-second shutdown; all waits are
 bounded and only the owned child is signaled.
+Combined owner/socket regressions cover left-to-right multi-key rechecking after
+EVAL/EXEC/mixed batches, overlapping FIFO waiters, replacement/type rechecks, and
+both explicit timeout/disconnect contender orders without stale consumption.
 Repeated schedules supplement the ownership argument below, not a proof or
-certification of unchanged-script/full crawler compatibility.
+certification of full-process crawler compatibility.
 
 ### Optional numeric/set reference comparison
 
@@ -750,6 +754,66 @@ Project SELECT, bare SET, five-key and stricter sandbox rules are checked in Rus
 not treated as reference-compatible. Missing prerequisites/mismatches fail.
 This is general-script evidence, not unchanged-crawler script/job certification.
 
+### Optional unchanged-crawler script components
+
+Requires Python 3, a Redis **7.4.x** server executable, and a clean, unmodified
+checkout of [K-Planky/swarmcrawl](https://github.com/K-Planky/swarmcrawl) at
+`f2c3a591af66e9a424178d9fbc5836740a71e896` (repository access may require owner
+permission). Obtain that revision in a separate checkout, not by switching or
+modifying an existing working tree:
+
+```sh
+git clone --no-checkout https://github.com/K-Planky/swarmcrawl /absolute/scratch/swarmcrawl
+git -C /absolute/scratch/swarmcrawl checkout --detach f2c3a591af66e9a424178d9fbc5836740a71e896
+cargo build --locked
+python3 tests/compare_crawler_scripts.py \
+  --crawler-checkout /absolute/scratch/swarmcrawl \
+  --redis-server /absolute/path/to/redis-server
+```
+
+The harness only **reads** this checkout. It checks revision, clean Git status
+(with optional locks disabled), and all six Lua source SHA-256s before/after;
+it consumes the five exact runtime compositions: submit, worker identity, and
+shared protocol plus claim, complete/fail, or abort. No source rewriting, known
+script substitutes, crawler build, or crawler runtime state is involved. Both
+servers and all data are owned/disposable; existing deployments are never used.
+Sockets, barriers, futures, polling, and child cleanup have bounded waits.
+A missing prerequisite, changed source, mismatch, or server failure exits nonzero.
+
+On **DB 0 and 15**, the same expected-result/invariant checks run on Keyper and
+Redis. They cover concurrent submission/deduplication, independent derived job
+keys, exact unique node/job IDs above 2^53 through signed-i64 exhaustion, unique
+claims, empty-frontier/nonempty-ownership progress, shared-child deduplication,
+concurrent publication with coherent six-read EXEC snapshots, duplicate/invalid
+completion, abort/publication races, frozen failure diagnostics, immediately
+readable retained final statistics, exact u64 totals/overflow and a small usize
+limit, orphan-ID gaps, and malformed/type-corrupt storage without resets.
+Unordered hash enumeration is canonicalized; script reply shapes and decimal
+strings are exact. Deterministic retained snapshots match the Redis baseline;
+nondeterministic race winners are checked against their permitted serial orders,
+not forced to match across separate runs. No infeasibly huge collection fixture
+is claimed for cardinalities above 2^53.
+
+The publication fixture processes **26 URLs**, counts **13 files**, **1 extension**
+(`html`) and **31 words**. Claims move queue entries into ownership within one
+EVAL; publication deduplicates children, merges one contribution, releases the
+owner and decides completion within another. A concurrent six-read EXEC is
+ordered wholly before or after publication, so it cannot observe new statistics
+with old ownership or a done marker before final statistics. Each batch uses the
+same exclusive state owner as ordinary commands; PING is not a history witness.
+
+The reference-only priority probe uses CLIENT LIST to confirm a blocked waiter
+before EVAL/EXEC/mixed batches fill b then a: Redis **7.4.0** selects **a** for
+`BLPOP a b 0`, matching this project's left-to-right contract. CLIENT LIST is
+not a Keyper command. Default Rust tests independently gate actual Keyper waiter
+registration and verify this boundary, including FIFO, timeout and disconnect
+cleanup. Other Redis versions are not certified by this result.
+
+These are **component tests**, not full crawler processes, HTTP request counts,
+or the original crawler Redis suites. Those suites still require excluded
+SCAN/DEL/LRANGE/LSET/TTL helpers; they are not silently skipped and called passes.
+Full-process one/multiple-node verification and a demo runbook remain next.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
@@ -781,6 +845,7 @@ This is general-script evidence, not unchanged-crawler script/job certification.
 - `tests/compare_transactions.py`: opt-in transaction comparison with an owned reference Redis.
 - `tests/eval.rs`: EVAL wire semantics, error phases, isolation and concurrent atomic units.
 - `tests/compare_eval.py`: opt-in general EVAL/database comparison with owned servers.
+- `tests/compare_crawler_scripts.py`: opt-in unchanged-script components and retained-state reference checks.
 - `tests/lua_runtime.rs`, `tests/lua_reference.rs`: language/conversion isolation and opt-in references.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
@@ -889,8 +954,8 @@ committed state, so variadic LPUSH exposes its final head, never its first
 intermediate insertion. Reentering creates a new FIFO position. Only committed
 nonempty lists trigger service: SET, failed pushes, or a list filled then
 emptied/replaced within one unit do not themselves wake a waiter. The service
-boundary is tested with actual EXEC, EVAL, and EVAL inside EXEC. Combined
-multi-key/timeout/disconnect script regressions remain further verification.
+boundary is tested with actual EXEC, EVAL, and EVAL inside EXEC, including
+multi-key/FIFO, replacement, and explicit timeout/disconnect contender orders.
 If an atomic batch fills b
 then a for a waiter on `[a, b]`, the recheck must select a; this project's explicit
 linearizability requirement takes precedence over Redis prose describing
@@ -930,13 +995,12 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: verify the exact unchanged crawler script compositions and combined
-atomic-batch/waiter races. General EVAL, transactions and the six-read snapshot
-are implemented; their tests do not certify the crawler's script-wide transitions.
-
-Later work includes full-process verification of the
-**unmodified** external crawler. Crawler sources and Git state must not be changed;
-compatibility code and harnesses belong here.
-Neither crawler interoperability nor any live demo has been verified. Broad
+Next: full-process verification of the **unmodified** external crawler with
+controlled HTTP fixtures, one/multiple nodes and a reproducible demo runbook.
+General EVAL, transactions, the six-read snapshot, unchanged-script components,
+and combined atomic-batch/waiter regressions pass; component evidence does not
+certify process lifecycle, HTTP deduplication/concurrency, or a live demo.
+Crawler sources and Git state must not be changed; compatibility code and
+harnesses belong here. Broad
 Redis compatibility, RESP3, authentication, pub/sub, and public-network hardening
 are not claimed.

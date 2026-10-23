@@ -208,6 +208,96 @@ async fn exec_defers_waiters_until_final_state_and_rechecks_key_priority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn atomic_batches_recheck_key_order_and_fifo_against_final_state() {
+    let mut server = TestServer::start().await;
+    let mut writer = server.connect().await;
+    for mode in 0..3 {
+        let mut first = server.connect().await;
+        send(&mut first, &[b"BLPOP", b"a", b"b", b"a", b"0"]).await;
+        server.count(1).await;
+        let mut second = server.connect().await;
+        send(&mut second, &[b"BRPOP", b"b", b"a", b"0"]).await;
+        server.count(2).await;
+        let mut third = server.connect().await;
+        send(&mut third, &[b"BLPOP", b"a", b"b", b"0"]).await;
+        server.count(3).await;
+        let source = b"redis.call('RPUSH','b','b1','b2'); redis.call('RPUSH','a','a1','a2'); return {redis.call('LLEN','a'),redis.call('LLEN','b')}";
+        let lengths = Reply::Array(Some(vec![Reply::Integer(2), Reply::Integer(2)]));
+        if mode == 0 {
+            assert_eq!(call(&mut writer, &[b"EVAL", source, b"0"]).await, lengths);
+        } else {
+            assert_eq!(call(&mut writer, &[b"MULTI"]).await, ok());
+            let commands: Vec<Vec<&[u8]>> = if mode == 1 {
+                vec![
+                    vec![b"RPUSH", b"b", b"b1", b"b2"],
+                    vec![b"RPUSH", b"a", b"a1", b"a2"],
+                ]
+            } else {
+                // Readiness must not escape an EXEC-contained EVAL either.
+                vec![
+                    vec![b"EVAL", b"return redis.call('RPUSH','b','b1','b2')", b"0"],
+                    vec![b"RPUSH", b"a", b"a1", b"a2"],
+                ]
+            };
+            for command in commands {
+                assert_eq!(
+                    call(&mut writer, &command).await,
+                    Reply::Simple(b"QUEUED".to_vec())
+                );
+            }
+            assert_eq!(call(&mut writer, &[b"EXEC"]).await, lengths);
+        }
+        // b was pushed first, but every pop has a sequential witness AFTER the
+        // whole batch: original key order, then the next waiter's own order.
+        assert_eq!(receive(&mut first).await, pair(b"a", b"a1"));
+        assert_eq!(receive(&mut second).await, pair(b"b", b"b2"));
+        assert_eq!(receive(&mut third).await, pair(b"a", b"a2"));
+        server.count(0).await;
+        assert_eq!(
+            call(&mut writer, &[b"LPOP", b"b"]).await,
+            Reply::Bulk(Some(b"b1".to_vec()))
+        );
+        assert_eq!(
+            call(&mut writer, &[b"EXISTS", b"a", b"b"]).await,
+            Reply::Integer(0)
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn atomic_replacement_rechecks_types_without_publishing_transient_items() {
+    let mut server = TestServer::start().await;
+    let mut writer = server.connect().await;
+    let mut both = server.connect().await;
+    let mut only_a = server.connect().await;
+    send(&mut both, &[b"BLPOP", b"a", b"b", b"0"]).await;
+    server.count(1).await;
+    send(&mut only_a, &[b"BRPOP", b"a", b"0"]).await;
+    server.count(2).await;
+    let source = b"redis.call('RPUSH','a','transient'); redis.call('SET','a','string'); return redis.call('RPUSH','b','committed')";
+    assert_eq!(
+        call(&mut writer, &[b"EVAL", source, b"0"]).await,
+        Reply::Integer(1)
+    );
+    // b triggers a recheck for the first waiter; a's final wrong type wins.
+    assert!(matches!(receive(&mut both).await, Reply::Error(e) if e.starts_with(b"WRONGTYPE")));
+    // a is not a final-state ready list, so its sole waiter remains registered.
+    server.count(1).await;
+    assert_eq!(
+        call(&mut writer, &[b"GET", b"a"]).await,
+        Reply::Bulk(Some(b"string".to_vec()))
+    );
+    assert_eq!(
+        call(&mut writer, &[b"LPOP", b"b"]).await,
+        Reply::Bulk(Some(b"committed".to_vec()))
+    );
+    drop(only_a);
+    server.count(0).await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_waiter_publication_is_after_the_outer_unit_even_on_error() {
     let mut server = TestServer::start().await;
     let mut writer = server.connect().await;

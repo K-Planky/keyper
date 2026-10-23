@@ -1044,6 +1044,157 @@ fn set_creation_and_empty_deletion_do_not_wake_waiters_but_list_readiness_does()
     empty_indexes(&owner);
 }
 
+fn atomic_lists(owner: &mut Owner, in_exec: bool, now: Instant) {
+    let command = DatabaseCommand::Eval {
+        source: b"redis.call('RPUSH','b','B'); redis.call('RPUSH','a','A'); return {redis.call('LLEN','a'),redis.call('LLEN','b')}".to_vec(),
+        numkeys: b"0".to_vec(),
+        args: Vec::new(),
+    };
+    let command = if in_exec {
+        Operation::Transaction(vec![QueuedCommand::Database(command)])
+    } else {
+        Operation::Single(command)
+    };
+    let (reply, mut receive) = oneshot::channel();
+    owner.process(
+        Work {
+            database: DB,
+            command,
+            reply,
+        },
+        now,
+    );
+    let lengths = Reply::Array(Some(vec![Reply::Integer(1), Reply::Integer(1)]));
+    assert_eq!(
+        receive.try_recv().unwrap(),
+        if in_exec {
+            Reply::Array(Some(vec![lengths]))
+        } else {
+            lengths
+        }
+    );
+}
+
+#[test]
+fn script_and_exec_timeout_contenders_have_one_terminal_outcome_and_no_later_consumption() {
+    for in_exec in [false, true] {
+        for expiry_first in [false, true] {
+            let now = Instant::now();
+            let deadline = now + Duration::from_millis(1);
+            let mut owner = Owner::default();
+            let mut waiting = send(
+                &mut owner,
+                DB,
+                pop(ListEnd::Left, &[b"a", b"b", b"a"], b"0.001"),
+                now,
+            );
+            pending(&mut waiting);
+            if expiry_first {
+                owner.expire(deadline);
+                assert_eq!(waiting.try_recv().unwrap(), Reply::Array(None));
+            }
+            // Explicit contender orders, not sleeping near a deadline. The
+            // producer may finish after the deadline without early expiry or
+            // an independent timer mutating state halfway through its script.
+            atomic_lists(&mut owner, in_exec, deadline);
+            if !expiry_first {
+                assert_eq!(waiting.try_recv().unwrap(), pair(b"a", b"A"));
+            }
+            owner.expire(deadline + Duration::from_secs(10));
+            empty_indexes(&owner);
+            if expiry_first {
+                assert_eq!(
+                    execute(&mut owner, DB, pop(ListEnd::Left, &[b"a"], b"0"), deadline),
+                    pair(b"a", b"A")
+                );
+            }
+            assert_eq!(
+                execute(&mut owner, DB, pop(ListEnd::Left, &[b"b"], b"0"), deadline),
+                pair(b"b", b"B")
+            );
+            assert_eq!(
+                execute(
+                    &mut owner,
+                    DB,
+                    push(ListEnd::Right, b"a", &[b"later"]),
+                    deadline
+                ),
+                Reply::Integer(1)
+            );
+            assert_eq!(
+                execute(&mut owner, DB, pop(ListEnd::Left, &[b"a"], b"0"), deadline),
+                pair(b"a", b"later")
+            );
+            empty_indexes(&owner);
+        }
+    }
+}
+
+#[test]
+fn script_and_exec_disconnect_contenders_skip_closed_waiters_but_never_undo_committed_pops() {
+    for in_exec in [false, true] {
+        for disconnect_first in [false, true] {
+            let now = Instant::now();
+            let mut owner = Owner::default();
+            let first = send(
+                &mut owner,
+                DB,
+                pop(ListEnd::Left, &[b"a", b"b"], b"1000"),
+                now,
+            );
+            let mut second = send(
+                &mut owner,
+                DB,
+                pop(ListEnd::Left, &[b"a", b"b"], b"1000"),
+                now,
+            );
+            // Option lets us drop the receiver on either side of commitment,
+            // without guessing when a socket's EOF happens to be observed.
+            let mut first = Some(first);
+            if disconnect_first {
+                drop(first.take());
+            }
+            atomic_lists(&mut owner, in_exec, now);
+            drop(first.take()); // A queued reply can be lost, not requeued.
+            assert_eq!(
+                second.try_recv().unwrap(),
+                if disconnect_first {
+                    pair(b"a", b"A")
+                } else {
+                    pair(b"b", b"B")
+                }
+            );
+            if disconnect_first {
+                assert_eq!(
+                    execute(&mut owner, DB, pop(ListEnd::Left, &[b"b"], b"0"), now),
+                    pair(b"b", b"B")
+                );
+            }
+            owner.reap_closed();
+            owner.expire(now + Duration::from_secs(2000));
+            empty_indexes(&owner);
+            assert_eq!(
+                execute(
+                    &mut owner,
+                    DB,
+                    DatabaseCommand::Exists(vec![b"a".to_vec(), b"b".to_vec()]),
+                    now
+                ),
+                Reply::Integer(0)
+            );
+            assert_eq!(
+                execute(&mut owner, DB, push(ListEnd::Right, b"a", &[b"later"]), now),
+                Reply::Integer(1)
+            );
+            assert_eq!(
+                execute(&mut owner, DB, pop(ListEnd::Left, &[b"a"], b"0"), now),
+                pair(b"a", b"later")
+            );
+            empty_indexes(&owner);
+        }
+    }
+}
+
 #[tokio::test]
 async fn dropping_execute_notifies_a_dormant_owner_without_any_further_work() {
     let (client, done, mut count) = crate::state::observed().unwrap();
