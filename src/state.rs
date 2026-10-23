@@ -61,6 +61,7 @@ impl Databases {
         // (or full variadic operation / collection snapshot) is the linearization point.
         // Replies own bytes; sending/dropping one cannot retain or undo access.
         match command {
+            DatabaseCommand::Eval { .. } => unreachable!("EVAL executes at the owner boundary"),
             DatabaseCommand::Get(key) => match entries.get(&key) {
                 None => Reply::Bulk(None),
                 Some(Value::String(value)) => Reply::Bulk(Some(value.clone())),
@@ -421,7 +422,7 @@ fn run(work: mpsc::Receiver<Work>, canceled: Arc<Notify>) -> io::Result<()> {
 
 fn run_owner(work: mpsc::Receiver<Work>, canceled: Arc<Notify>, owner: Owner) -> io::Result<()> {
     // A timer driver on this same dedicated thread parks only between atomic
-    // units. Synchronous state work (and later Lua) never runs on network workers.
+    // units. Synchronous state work (including Lua) never runs on network workers.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;

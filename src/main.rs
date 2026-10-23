@@ -17,9 +17,10 @@ Options:
 Serves RESP2 PING, SELECT, GET, SET, EXISTS, LPUSH, RPUSH, BLPOP, BRPOP,
 INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
 HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS,
-TYPE, LLEN, LINDEX, LPOP (with optional count), MULTI, EXEC, DISCARD on 127.0.0.1.
+TYPE, LLEN, LINDEX, LPOP (with optional count), MULTI, EXEC, DISCARD, EVAL on 127.0.0.1.
 SELECT is first-command-only; SET has no options; blocking pops accept 1–5 keys.
-Transactions execute atomically, without rollback. Lua and other Redis commands are not implemented yet.
+Transactions and Lua 5.1 EVAL execute atomically, without rollback.
+Other Redis commands are unsupported; scripts have no time/heap quota.
 Press Ctrl-C to stop.";
 
 async fn run(config: Config) -> io::Result<()> {

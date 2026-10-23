@@ -11,6 +11,11 @@ pub(crate) enum ListEnd {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DatabaseCommand {
+    Eval {
+        source: Vec<u8>,
+        numkeys: Vec<u8>,
+        args: Vec<Vec<u8>>,
+    },
     Get(Vec<u8>),
     Set {
         key: Vec<u8>,
@@ -242,6 +247,36 @@ fn wrong_arity(command: &str) -> Reply {
 // text says wrong arity): keep those errors in the EXEC array, not EXECABORT.
 // Numeric/type conversion likewise remains execution-time work.
 fn parse(request: Request) -> Result<Command, Reply> {
+    parse_in_context(request, false)
+}
+
+/// Lua uses the same admission and execution semantics as wire commands, but
+/// arity/lookup diagnostics and forbidden contexts follow Redis's script rules.
+/// No connection state (especially SELECT or a MULTI queue) is available here.
+pub(crate) fn script_command(request: Request) -> QueuedCommand {
+    match parse_in_context(request, true) {
+        Ok(Command::Database(DatabaseCommand::Eval { .. }))
+        | Ok(Command::Multi | Command::Exec | Command::Discard) => QueuedCommand::Reply(
+            Reply::Error(b"ERR This Redis command is not allowed from script".to_vec()),
+        ),
+        Ok(Command::Select(_)) => QueuedCommand::Reply(late_select()),
+        Ok(Command::Ping(message)) => QueuedCommand::Reply(match message {
+            None => Reply::Simple(b"PONG".to_vec()),
+            Some(message) => Reply::Bulk(Some(message)),
+        }),
+        Ok(Command::RuntimeError(error)) | Err(error) => QueuedCommand::Reply(error),
+        Ok(Command::Database(command)) => QueuedCommand::Database(command),
+    }
+}
+
+fn parse_in_context(request: Request, script: bool) -> Result<Command, Reply> {
+    let wrong_arity = |command: &str| {
+        if script {
+            Reply::Error(b"ERR Wrong number of args calling Redis command from script".to_vec())
+        } else {
+            wrong_arity(command)
+        }
+    };
     let mut args = request.into_iter();
     let Some(name) = args.next() else {
         return Err(Reply::Error(b"ERR empty command".to_vec()));
@@ -261,9 +296,18 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity(label));
         }
         Ok(command)
+    } else if name.eq_ignore_ascii_case(b"EVAL") {
+        if args.len() < 2 {
+            return Err(wrong_arity("eval"));
+        }
+        Ok(Command::Database(DatabaseCommand::Eval {
+            source: args.next().unwrap(),
+            numkeys: args.next().unwrap(),
+            args: args.collect(),
+        }))
     } else if name.eq_ignore_ascii_case(b"PING") {
         if args.len() > 1 {
-            return Ok(Command::RuntimeError(wrong_arity("ping")));
+            return Ok(Command::RuntimeError(self::wrong_arity("ping")));
         }
         Ok(Command::Ping(args.next()))
     } else if name.eq_ignore_ascii_case(b"SELECT") {
@@ -315,7 +359,7 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity("lpop"));
         }
         if args.len() > 2 {
-            return Ok(Command::RuntimeError(wrong_arity("lpop")));
+            return Ok(Command::RuntimeError(self::wrong_arity("lpop")));
         }
         Ok(Command::Database(DatabaseCommand::ListPop {
             key: args.next().unwrap(),
@@ -364,7 +408,7 @@ fn parse(request: Request) -> Result<Command, Reply> {
             return Err(wrong_arity("hset"));
         }
         if args.len() % 2 != 1 {
-            return Ok(Command::RuntimeError(wrong_arity("hset")));
+            return Ok(Command::RuntimeError(self::wrong_arity("hset")));
         }
         let key = args.next().unwrap();
         let mut pairs = Vec::with_capacity(args.len() / 2);
@@ -448,7 +492,11 @@ fn parse(request: Request) -> Result<Command, Reply> {
         }))
     } else {
         // Never reflect arbitrary (possibly binary or sensitive) input.
-        Err(Reply::Error(b"ERR unknown command".to_vec()))
+        Err(Reply::Error(if script {
+            b"ERR Unknown Redis command called from script".to_vec()
+        } else {
+            b"ERR unknown command".to_vec()
+        }))
     }
 }
 

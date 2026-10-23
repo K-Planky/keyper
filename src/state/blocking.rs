@@ -8,7 +8,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use super::{DATABASES, DatabaseIndex, Databases, Operation, Value, Work, wrong_type};
-use crate::command::{DatabaseCommand, ListEnd, QueuedCommand};
+use crate::command::{DatabaseCommand, ListEnd, QueuedCommand, parse_integer, script_command};
 use crate::resp::Reply;
 
 #[cfg(test)]
@@ -230,6 +230,43 @@ impl Owner {
         command: DatabaseCommand,
         ready: &mut Vec<Vec<u8>>,
     ) -> Reply {
+        if let DatabaseCommand::Eval {
+            source,
+            numkeys,
+            args,
+        } = command
+        {
+            // Validation is execution-time work, including inside EXEC. Parsing
+            // source follows numkeys validation and cannot mutate the database.
+            let count = match parse_integer(&numkeys) {
+                None => {
+                    return Reply::Error(b"ERR value is not an integer or out of range".to_vec());
+                }
+                Some(n) if n < 0 => {
+                    return Reply::Error(b"ERR Number of keys can't be negative".to_vec());
+                }
+                Some(n) if n as u64 > args.len() as u64 => {
+                    return Reply::Error(
+                        b"ERR Number of keys can't be greater than number of args".to_vec(),
+                    );
+                }
+                Some(n) => n as usize,
+            };
+            let (keys, args) = args.split_at(count);
+            // The callback borrows this owner for the entire VM lifetime. All
+            // calls share the outer ready list; no intermediate waiter service,
+            // cancellation, or other client's operation can run inside EVAL.
+            // script_command forbids nested EVAL and transaction controls.
+            return crate::scripting::execute(&source, keys, args, |request| {
+                let command = script_command(request);
+                match command {
+                    QueuedCommand::Reply(reply) => reply,
+                    QueuedCommand::Database(command) => {
+                        self.execute_atomic(database, command, ready)
+                    }
+                }
+            });
+        }
         let pushed_key = match &command {
             DatabaseCommand::Push { key, .. } => Some(key.clone()),
             _ => None,

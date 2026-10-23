@@ -1,4 +1,4 @@
-//! Synchronous Lua 5.1 language boundary. Not yet exposed as TCP EVAL.
+//! Synchronous Lua 5.1 language boundary used by owner-side EVAL.
 //!
 //! The caller supplies command execution; this module owns language/environment
 //! isolation and RESP2 conversion, not database semantics or atomicity. Run it on

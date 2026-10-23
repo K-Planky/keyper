@@ -5,15 +5,16 @@ A small, in-memory Redis-compatible service being built in Rust on Tokio.
 **Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
 BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
 HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS, TYPE, LLEN, LINDEX, LPOP,
-MULTI, EXEC, and DISCARD (29 commands).**
+MULTI, EXEC, DISCARD, and EVAL (30 commands).**
 Sixteen in-memory databases hold strings, lists, sets, or hashes and belong to one
 dedicated state thread, separate from asynchronous networking. Blocking
 pops include checked deadlines, disconnect cancellation, and bounded shutdown.
 Ordered pipelining and the unchanged crawler's Redis 1.7.1 RESP2 client setup
 are verified, as are isolated transactions and the crawler's six-read snapshot
-composition. A genuine sandboxed Lua 5.1 **library boundary** is tested separately;
-**TCP EVAL/database integration and full crawler interoperability are not yet
-implemented**.
+composition. Genuine sandboxed Lua 5.1 EVAL executes on that same owner,
+including inside EXEC, with no intermediate database or waiter visibility.
+**The unchanged crawler scripts and full-process interoperability are not yet
+certified.**
 
 ## Prerequisites and build
 
@@ -182,8 +183,9 @@ five-second deadline. Failure to drain is fatal: the executable exits with
 status 1, never resets/replaces state and resumes. Embedders of `server::serve`
 must likewise exit on failure rather than restart while an owner might still be
 running. Pending finite/indefinite blocking requests are canceled without waiting
-for a producer; future Lua shutdown behavior is not yet certified. There is no
-persistence; every explicit restart starts empty.
+for a producer. Running scripts are not interrupted by disconnect/shutdown;
+a nonterminating script reaches the same fatal drain deadline (process-tested on
+Linux). There is no persistence; every explicit restart starts empty.
 
 ### Configuration and exposure
 
@@ -230,6 +232,7 @@ persistence; every explicit restart starts empty.
 | `MULTI` | Simple `OK`; begin a connection-local transaction queue |
 | `EXEC` | Array of queued replies, or EXECABORT for a rejected transaction |
 | `DISCARD` | Simple `OK`; discard the open transaction without execution |
+| `EVAL script numkeys [key ...] [arg ...]` | Lua 5.1 return converted to RESP2; isolated execution, including retained writes on runtime errors |
 | `TYPE key` | Simple string `none`, `string`, `list`, `set`, or `hash` |
 | `LLEN key` | Integer list length, or 0 for an absent key |
 | `LINDEX key index` | Bulk string at a zero-based index; negative indices count from the tail; null bulk if absent/out of bounds |
@@ -240,8 +243,9 @@ empty, NUL, CR/LF, and non-UTF-8 data. Empty and absent values are distinct.
 Integer arguments use canonical decimal syntax (no `+`, whitespace, leading zeros,
 `-0`, or fractions). Invalid numeric arguments (subject to LINDEX's lookup order
 below), wrong arity, SET options, empty command arrays, and unsupported commands
-return `ERR` replies without data mutation; the connection remains usable. Pushes create a list when the key is absent, and
-return `WRONGTYPE` without changing an existing non-list. GET rejects non-strings
+return `ERR` replies without that command's data mutation; the connection remains usable.
+An enclosing script/transaction does **not** roll back earlier successful commands.
+Pushes create a list when the key is absent, and return `WRONGTYPE` without changing an existing non-list. GET rejects non-strings
 without mutation; bare SET replaces any supported type with a string. LPUSH
 reverses its supplied values at the head (`LPUSH k a b c` yields `[c, b, a]`); RPUSH appends them
 (`RPUSH k a b c` yields `[a, b, c]`). Duplicates and empty/binary elements are
@@ -302,7 +306,7 @@ not used as allocation sizes. All counted removals and last-element key deletion
 are one atomic operation. List reads and empty LPOP do not wake/reorder blocked
 waiters; existing waiters get their post-push service before a later LPOP runs.
 Separate LINDEX and LPOP calls do **not** form an atomic claim; that requires the
-future script boundary used by the crawler.
+EVAL boundary used by the crawler.
 
 ### Transactions
 
@@ -352,8 +356,9 @@ EOF
 
 The unchanged crawler's `redis::pipe().atomic()` snapshot composition is verified:
 HGETALL(meta), SCARD(seen), LLEN(frontier), HLEN(in-flight), HGETALL(stats),
-HGETALL(extensions), in that order. Actual job execution still requires Lua/EVAL.
-WATCH/CAS, script execution, and persistence are not provided by this boundary.
+HGETALL(extensions), in that order. EVAL also queues real owner work, with
+numkeys/source validation deferred until EXEC; script errors are array entries,
+and later queued commands still execute. WATCH/CAS and persistence are not provided.
 See the [official transaction semantics](https://redis.io/docs/latest/develop/using-commands/transactions/).
 
 ### Resource limits and ordering
@@ -394,8 +399,8 @@ blocking pop: queued commands cannot unblock their own connection or overtake
 its current command/reply. Separate connections progress independently. EOF
 ends the session, discarding unexecuted input rather than continuing a half-closed
 pipeline. A pipeline is **not atomic**: its prefix is visible and other clients
-may intervene between its commands. Only explicit MULTI/EXEC batches execute
-atomically as a group; queuing alone does not acquire database ownership.
+may intervene between its commands. Explicit MULTI/EXEC batches and individual
+EVAL scripts execute atomically; queuing alone does not acquire database ownership.
 
 ### RESP2 client startup and pipelining
 
@@ -449,21 +454,57 @@ Dropping a caller's Redis-client query future is **not** retracting a dispatched
 request: the multiplexed driver can keep its connection/work alive and drain the
 reply. Later cloned queries remain behind it. No retry or rollback is implied;
 mutations with lost responses remain ambiguous. Actual socket closure follows
-the EOF cancellation policy above. Full crawler commands still need EVAL with
-genuine Lua; client/transaction compatibility alone does not certify crawler jobs.
+the EOF cancellation policy above. General EVAL is implemented; client, transaction,
+and general-script compatibility alone do not certify the unchanged crawler jobs.
 
-## Lua language boundary (not yet TCP EVAL)
+## Atomic EVAL and Lua 5.1
 
-`keyper::scripting::execute(source, keys, args, command)` is a synchronous,
-callback-based library boundary using mlua **0.12.2** and genuine Lua **5.1.5**.
-It does not parse known script patterns, dispatch script hashes, proxy to Redis,
-or provide a database implementation. The TCP server still rejects EVAL. The
-next integration step must call this boundary on the dedicated state owner,
-reuse its command semantics, retain ownership for the whole script, and defer
-waiter service until the enclosing EVAL/EXEC finishes. No async/network/blocking
-wait belongs in the callback. Runtime tests use explicit test-double replies;
-they do not certify database atomicity, script shutdown, or crawler execution.
+`EVAL script numkeys [key ...] [arg ...]` runs genuine Lua **5.1.5**, via mlua
+**0.12.2**, on the dedicated state owner. No known-script parsing/hash dispatch,
+native crawler substitutes, or Redis proxy is used. The callback-based library
+`keyper::scripting::execute` owns language/environment/conversion; the owner
+supplies the same real database command semantics used by ordinary clients.
+Ownership lasts through the **whole script and return capture**, including when
+EVAL is inside EXEC. No other database operation, timer/cancellation decision,
+or waiter consumption can observe intermediate effects. No waits or I/O occur
+in a script callback.
 
+```sh
+redis-cli -2 -h 127.0.0.1 -p 6380 EVAL \
+  "redis.call('SET',KEYS[1],ARGV[1]); return {redis.call('TYPE',KEYS[1]),redis.call('GET',KEYS[1])}" \
+  1 script-demo hello
+# 1) string (status reply); 2) "hello" (bulk string)
+redis-cli -2 -h 127.0.0.1 -p 6380 EVAL \
+  "redis.call('SET','script-kept','yes'); return redis.call('LPUSH','script-kept','bad')" 0
+# WRONGTYPE; the successful SET is retained, not rolled back.
+redis-cli -2 -h 127.0.0.1 -p 6380 GET script-kept
+# "yes"
+```
+
+- `numkeys` is a canonical nonnegative signed-64-bit integer no greater than the
+  remaining argument count. Validation occurs before source compilation, at
+  execution time (also in EXEC). Zero keys and more than five keys are valid.
+  KEYS contains that prefix; ARGV contains the remainder. Bad EVAL admission
+  arity dirties a transaction, but bad numkeys/source does not prevent queuing.
+- All data access stays in the connection's selected database. Derived or
+  undeclared key names work, matching standalone Redis's actual behavior (not
+  Redis Cluster's explicit-key guidance). No key whitelist is invented.
+- Script calls support the listed command forms. Unknown commands and admission
+  arity use Redis's script-specific errors. EVAL and MULTI/EXEC/DISCARD are
+  NOSCRIPT; SELECT always returns the project's late-selection error. Form,
+  numeric and type errors keep the ordinary command semantics. Bare SET and
+  the one-to-five-key pop restriction remain in force inside scripts.
+- BLPOP/BRPOP inside EVAL never suspend: pop immediately or return null. That
+  null becomes Lua false and returns as a **null bulk**, not a null array.
+  Pushes record readiness, but waiters run only after the **outermost** EVAL or
+  EXEC captures its result, even on a runtime/return-conversion error. A push
+  consumed or replaced within that unit never leaks an intermediate item.
+- Compilation errors have no effects. Runtime, command, explicit error replies,
+  and return-conversion errors retain earlier writes. `redis.call` stops on an
+  uncaught command error; `redis.pcall` allows the script to continue. An EXEC
+  containing a failed EVAL continues its later commands. Atomicity is not rollback.
+  Error codes/messages follow command semantics; source hash/stack decoration
+  and engine-specific Lua diagnostics are not byte-identical to Redis.
 - Each invocation creates and drops its own VM, with fresh binary-safe indexed
   KEYS/ARGV. There is no cache or cross-request Lua state. This favors a simple
   isolation argument over VM reuse/performance that has not been required.
@@ -502,12 +543,18 @@ they do not certify database atomicity, script shutdown, or crawler execution.
 - Conversion is limited to **128 levels / 1,048,576 nodes** in each direction;
   cycles and excessive replies error instead of overflowing Rust's stack.
   These are not byte or heap quotas. There is no script instruction/time/memory
-  quota, preemption, or rollback. Nonterminating scripts can stall their caller;
-  later server integration needs the documented fail-stop shutdown deadline.
+  quota, preemption, or rollback. A nonterminating script stalls **all database
+  work in every namespace**, though independent network workers can still PING.
+  Disconnect does not interrupt it. Shutdown waits up to the shared five-second
+  deadline, then the process exits nonzero without resetting or resuming state.
+  Large scripts/replies can exhaust memory; request/queue limits do not bound
+  script-created command arguments or stored data.
   This trusted-local subset is **not** a hostile-code sandbox or public service.
 
-Self-contained runtime checks: `cargo test --locked --test lua_runtime`. Numeric
-unit checks also cover all binary exponents and 100,000 seeded bit patterns.
+Self-contained checks: `cargo test --locked --test lua_runtime` (language) and
+`cargo test --locked --test eval` (real TCP/database bridge). Numeric unit checks
+also cover all binary exponents and 100,000 seeded bit patterns. These general
+scripts do not yet certify the unchanged crawler script compositions or jobs.
 
 ## Development checks
 
@@ -577,8 +624,18 @@ verify final-state service, FIFO/key priority, and no intermediate delivery.
 Socket tests own loopback servers on ephemeral ports, bound their waits, and
 clean up on failure. Controlled-clock tests check write deadlines; injected
 broken/short writes check delivery failures without depending on TCP timing.
+EVAL wire tests cover validation phases, all supported command calls, binary
+KEYS/ARGV and derived keys across sixteen databases, fresh environments, error
+contexts, exact decimal counters, retained writes, EVAL inside EXEC, nonwaiting
+pops, fragmented pipelines, incomplete input, and unread/lost replies. Competing
+scripts, EXECs and ordinary increments have contiguous batch results and exact
+item accounting. Synchronized sockets check deferred EVAL/EXEC waiter service,
+including after script errors. On Linux, an owned-process test observes the
+state thread's CPU progress during an infinite script, disconnects its client,
+checks independent PING, and verifies fatal five-second shutdown; all waits are
+bounded and only the owned child is signaled.
 Repeated schedules supplement the ownership argument below, not a proof or
-certification of EVAL/database integration or full crawler compatibility.
+certification of unchanged-script/full crawler compatibility.
 
 ### Optional numeric/set reference comparison
 
@@ -672,13 +729,34 @@ callbacks supply PING/type/integer/error replies; this is **not** Keyper TCP EVA
 or the database bridge. Sandbox exclusions/limits are tested locally rather than
 compared with Redis's broader API. No existing Redis or crawler is touched.
 
+### Optional EVAL/database reference comparison
+
+Using the same Python/Redis prerequisites and owned-endpoint policy:
+
+```sh
+cargo build --locked
+python3 tests/compare_eval.py --redis-server /absolute/path/to/redis-server
+```
+
+Verified with Redis **7.4.0**: **8,468** commands, including the general
+numeric/set/hash/list corpora through real Lua calls, validation/error phases,
+call/pcall/NOSCRIPT, exact decimal counters, derived/binary keys, nonwaiting pops,
+retained writes and EXEC-contained EVAL. Scripts normalize only unordered
+collection order. Comparison removes Redis's source hash/line suffix from
+uncaught command errors; codes/messages otherwise match exactly. Explicit
+syntax/runtime/denied-global/host-execution cases compare their error categories,
+not engine-specific diagnostics (Redis exposes a limited os table; Keyper none).
+Project SELECT, bare SET, five-key and stricter sandbox rules are checked in Rust,
+not treated as reference-compatible. Missing prerequisites/mismatches fail.
+This is general-script evidence, not unchanged-crawler script/job certification.
+
 ### Layout
 
 - `src/config.rs`: configuration and argument validation, without network I/O.
 - `src/resp.rs`: request framing, resource bounds, and RESP2 reply encoding.
 - `src/command.rs`: command admission/form checks, PING, selection and transaction queues.
 - `src/scripting.rs`, `src/scripting/`: isolated Lua boundary, RESP2 conversions,
-  and Redis-compatible numeric formatting; not yet connected to database execution.
+  and Redis-compatible numeric formatting; called synchronously by owner-side EVAL.
 - `src/state.rs`: typed database indices, sixteen maps, bounded channels, owner thread.
 - `src/state/set.rs`: dense set members with a hash index for constant-time membership/removal.
 - `src/state/numeric_sets_tests.rs`: numeric/set semantics and index churn checks.
@@ -701,6 +779,9 @@ compared with Redis's broader API. No existing Redis or crawler is touched.
 - `tests/compare_lists.py`: opt-in exact list/key comparison with an owned reference Redis.
 - `tests/transactions.rs`: raw transaction semantics and actual-client atomic snapshot/concurrency tests.
 - `tests/compare_transactions.py`: opt-in transaction comparison with an owned reference Redis.
+- `tests/eval.rs`: EVAL wire semantics, error phases, isolation and concurrent atomic units.
+- `tests/compare_eval.py`: opt-in general EVAL/database comparison with owned servers.
+- `tests/lua_runtime.rs`, `tests/lua_reference.rs`: language/conversion isolation and opt-in references.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
 ## Linearizability and failure contract
@@ -733,6 +814,13 @@ client operation or waiter consumption between commands; its entire result and
 retained runtime-error writes linearize as that batch. Waiter service follows
 reply capture. Cost is the sum of enclosed work plus replies/readiness service,
 not a copy of the database. MULTI is O(1); DISCARD frees O(queued commands/bytes).
+EVAL (also within EXEC) is likewise one non-interleaved unit: fresh VM setup,
+source compilation, all command calls and return capture share the owner order.
+Runtime errors retain preceding effects at this same boundary; waiters run after
+capture, never inside the script or between an EXEC-contained EVAL and other
+queued commands.
+Its cost depends on setup, source, executed Lua/commands and conversion; no
+whole-database copy, waits or external service are involved.
 SELECT linearizes at the connection-local
 state transition; input-validation errors linearize at validation without
 touching data. Other clients cannot change a connection's selected database.
@@ -801,8 +889,9 @@ committed state, so variadic LPUSH exposes its final head, never its first
 intermediate insertion. Reentering creates a new FIFO position. Only committed
 nonempty lists trigger service: SET, failed pushes, or a list filled then
 emptied/replaced within one unit do not themselves wake a waiter. The service
-boundary is tested with actual EXEC and simulated units; EVAL integration remains
-future work. If an atomic batch fills b
+boundary is tested with actual EXEC, EVAL, and EVAL inside EXEC. Combined
+multi-key/timeout/disconnect script regressions remain further verification.
+If an atomic batch fills b
 then a for a waiter on `[a, b]`, the recheck must select a; this project's explicit
 linearizability requirement takes precedence over Redis prose describing
 first-pushed-key priority. No caller may observe a partial atomic batch.
@@ -841,9 +930,9 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: connect the tested Lua 5.1 boundary to atomic owner-side EVAL execution,
-then verify the exact unchanged scripts. Transactions and the six-read snapshot are implemented; they do not
-substitute for the crawler's script-wide atomic transitions.
+Next: verify the exact unchanged crawler script compositions and combined
+atomic-batch/waiter races. General EVAL, transactions and the six-read snapshot
+are implemented; their tests do not certify the crawler's script-wide transitions.
 
 Later work includes full-process verification of the
 **unmodified** external crawler. Crawler sources and Git state must not be changed;

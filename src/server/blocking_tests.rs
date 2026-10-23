@@ -208,6 +208,54 @@ async fn exec_defers_waiters_until_final_state_and_rechecks_key_priority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_waiter_publication_is_after_the_outer_unit_even_on_error() {
+    let mut server = TestServer::start().await;
+    let mut writer = server.connect().await;
+    let mut waiter = server.connect().await;
+    for in_exec in [false, true] {
+        send(&mut waiter, &[b"BLPOP", b"list", b"0"]).await;
+        server.count(1).await;
+        let push = b"return redis.call('RPUSH','list','transient')";
+        let pop = b"return redis.call('BLPOP','list',0)";
+        if in_exec {
+            assert_eq!(call(&mut writer, &[b"MULTI"]).await, ok());
+            for source in [push.as_slice(), pop.as_slice()] {
+                assert_eq!(
+                    call(&mut writer, &[b"EVAL", source, b"0"]).await,
+                    Reply::Simple(b"QUEUED".to_vec())
+                );
+            }
+            assert_eq!(
+                call(&mut writer, &[b"EXEC"]).await,
+                Reply::Array(Some(vec![Reply::Integer(1), pair(b"list", b"transient")]))
+            );
+        } else {
+            let source =
+                b"redis.call('RPUSH','list','transient'); return redis.call('BRPOP','list',0)";
+            assert_eq!(
+                call(&mut writer, &[b"EVAL", source, b"0"]).await,
+                pair(b"list", b"transient")
+            );
+        }
+        // The inner push was not visible to the already-registered waiter.
+        server.count(1).await;
+        assert_eq!(
+            call(&mut writer, &[b"LLEN", b"list"]).await,
+            Reply::Integer(0)
+        );
+        let source =
+            b"redis.call('RPUSH','list','retained'); return redis.error_reply('ERR after write')";
+        assert_eq!(
+            call(&mut writer, &[b"EVAL", source, b"0"]).await,
+            Reply::Error(b"ERR after write".to_vec())
+        );
+        assert_eq!(receive(&mut waiter).await, pair(b"list", b"retained"));
+        server.count(0).await;
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_pops_preserve_end_key_type_and_binary_priority() {
     let mut server = TestServer::start().await;
     let mut client = server.connect().await;
