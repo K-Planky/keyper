@@ -1,8 +1,8 @@
 # Keyper
 
-A small, in-memory Redis-compatible service being built in Rust on Tokio.
+A small, in-memory Redis-compatible service built in Rust on Tokio.
 
-**Current boundary: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
+**Supported subset: RESP2, PING, SELECT, GET, bare SET, EXISTS, LPUSH, RPUSH,
 BLPOP, BRPOP, INCR, SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
 HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HVALS, TYPE, LLEN, LINDEX, LPOP,
 MULTI, EXEC, DISCARD, and EVAL (30 commands).**
@@ -19,6 +19,11 @@ one/three nodes, concurrent jobs, exact local HTTP counts and statistics,
 progress/follow, retained results, abort and failure. See the
 [process suite](#optional-full-process-crawler-verification) and
 [interactive demo](demo/README.md). This is a tested subset, not full Redis.
+
+- [Build](#prerequisites-and-build) · [Server/client quick start](#start-the-server-and-talk-to-it)
+- [Commands and limits](#implemented-command-and-transport-contracts) · [Lua](#atomic-eval-and-lua-51)
+- [Tests and integration suites](#development-checks) · [Linearizability](#linearizability-and-failure-contract)
+- [Fresh-source verification and coverage](VERIFICATION.md) · [Demo runbook](demo/README.md)
 
 ## Prerequisites and build
 
@@ -1078,13 +1083,20 @@ mutations. This is not a reliable work queue or exactly-once processing. Closing
 the last work sender also drops all pending waits, including indefinite ones;
 normal shutdown never waits for a producer.
 
-## Remaining work
+## Readiness and limitations
 
-Next: final requirements/readability audit, fresh-checkout acquisition and full
-demo rehearsal. General EVAL, transactions, the six-read snapshot, unchanged
-scripts, atomic-batch/waiter regressions and four actual crawler/HTTP process
-cases pass. This does not certify a live human-assisted demo, post-demo visibility,
-grading tag or course submission; those require the owner's participation.
-Crawler sources and Git state must not be changed; compatibility code and
-harnesses belong here. Broad Redis compatibility, RESP3, authentication, pub/sub,
-and public-network hardening are not claimed.
+The final technical audit passed from fresh remote checkouts: quality gates,
+core tests, reference comparisons, unchanged scripts, and four actual crawler/HTTP
+process cases. The tracked demo commands were also rehearsed with separate
+server/client/node processes, including one/three-node runs and empty restart.
+See [verification, coverage and known gaps](VERIFICATION.md) for the exact
+boundary and reproduction commands. No local planning files are needed.
+
+A live human-assisted demo, post-demo visibility, the exact graded `1.0.0` tag,
+and LMS submission still require the owner's participation and authorization;
+technical readiness does not certify them. Keep the repository private until
+after the live demo. Crawler sources and Git state must not be changed;
+compatibility code and harnesses belong here. Broad Redis compatibility, RESP3,
+authentication, pub/sub, persistence/recovery, hostile-code scripting and
+public-network hardening are not claimed. Automatic linearizability checking
+remains optional and deferred.
