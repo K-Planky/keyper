@@ -14,7 +14,11 @@ are verified, as are isolated transactions and the crawler's six-read snapshot
 composition. Genuine sandboxed Lua 5.1 EVAL executes on that same owner,
 including inside EXEC, with no intermediate database or waiter visibility.
 The five unchanged crawler script compositions pass component checks against
-Redis 7.4.0. **Full-process crawler interoperability is not yet certified.**
+Redis 7.4.0. Full-process checks also pass with the pinned unchanged crawler:
+one/three nodes, concurrent jobs, exact local HTTP counts and statistics,
+progress/follow, retained results, abort and failure. See the
+[process suite](#optional-full-process-crawler-verification) and
+[interactive demo](demo/README.md). This is a tested subset, not full Redis.
 
 ## Prerequisites and build
 
@@ -555,7 +559,8 @@ Self-contained checks: `cargo test --locked --test lua_runtime` (language) and
 `cargo test --locked --test eval` (real TCP/database bridge). Numeric unit checks
 also cover all binary exponents and 100,000 seeded bit patterns. The optional
 unchanged-script component suite below adds crawler-specific verification;
-neither suite certifies actual crawler processes or HTTP behavior.
+neither alone certifies actual crawler processes or HTTP behavior. The separate
+[process suite](#optional-full-process-crawler-verification) covers that boundary.
 
 ## Development checks
 
@@ -812,7 +817,84 @@ cleanup. Other Redis versions are not certified by this result.
 These are **component tests**, not full crawler processes, HTTP request counts,
 or the original crawler Redis suites. Those suites still require excluded
 SCAN/DEL/LRANGE/LSET/TTL helpers; they are not silently skipped and called passes.
-Full-process one/multiple-node verification and a demo runbook remain next.
+The separate process suite below covers actual CLI/nodes/HTTP, not those helpers.
+
+### Optional full-process crawler verification
+
+Requires **Linux/Unix signals**, Python **3.9+**, Rust **1.99.0**/native build tools,
+a Redis **7.4.x** executable, and the pinned clean crawler checkout obtained
+[above](#optional-unchanged-crawler-script-components). Verified on Linux x86_64
+with Python 3.12.3 and Redis 7.4.0. No Docker daemon, source patch, saved deployment
+or existing Redis endpoint is used. The first crawler build needs cached crates
+or crates.io access; reserve several GB for release/debug build output.
+
+From the Keyper root:
+
+```sh
+cargo build --locked
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_crawler*.py' -v
+# --output must not exist and must be outside the crawler checkout.
+PYTHONDONTWRITEBYTECODE=1 python3 tests/crawler_process.py \
+  --crawler-checkout /absolute/scratch/swarmcrawl \
+  --redis-server /absolute/path/to/redis-server \
+  --output /absolute/scratch/keyper-process-run \
+  --crawler-tests
+```
+
+The suite checks the pinned clean source and six Lua digests before/after,
+builds the unchanged crawler with `cargo +1.99.0 build --release --locked
+--manifest-path ... --target-dir <output>/crawler-target` from outside its
+checkout, and owns both loopback database servers, HTTP fixtures and processes.
+Keyper uses an OS-selected port; Redis uses a reserved loopback port and must
+report its own successful listen (a conflict fails rather than using another
+server). Persistence is disabled. All startup, request, body-gate, crawl and
+drain waits are bounded. Cleanup releases bodies and interrupts only owned
+processes; it never clears an existing database. Logs/builds remain in `--output`
+for inspection, including on failure; remove only that owned directory afterward.
+Do not run Python with `-O`: the executable test oracles use assertions.
+
+Each endpoint runs **one node / DB 0** and **three nodes / DB 15**, with fresh
+namespaces. The actual `check`, `submit`, `jobs`, `status`, `status -f`, `stats`,
+and `abort` CLI commands verify:
+
+- Two broad jobs plus a simultaneous narrow job seeded at `/a/leaf-0.html`;
+  the shared leaf is fetched **once per job**, not globally skipped. Its narrow
+  scope counts one file/two words. Fragment/repeated submission returns retained
+  IDs without CLI HTTP traffic. **64 main graph paths** receive 65 GETs (the
+  shared leaf twice), including redirect/404; no out-of-scope or extra HEADs.
+- Each main job finishes at **32 crawled/discovered, zero frontier/in-flight,
+  30 files, four extensions, 52 words**: `html 27`, `jpeg 1`, `jpg 1`, `pdf 1`.
+  One/three-node results and exact GET counts equal the real-Redis baseline.
+- Body gates hold **10 requests with one node**, and **at least 21 across three
+  nodes**, before release. Existing opt-in diagnostics check each node's HTTP
+  peak **≤10** (one-node peak exactly 10), drained HTTP/owned/CPU gauges,
+  owned-task peak ≤20 and CPU peak ≤4. This verifies real concurrency and each
+  cap without assuming equal work allocation. Aggregate fixture counts alone
+  do not prove the individual cap.
+- A held parent with **empty frontier / one in-flight** remains running, rejects
+  partial final stats and publishes its child before done. Follow histories are
+  coherent/monotonic and exit; final stats are immediately readable and retained
+  from fresh CLI processes after all nodes exit.
+- Aborting held work freezes diagnostics and discards late links; a controlled
+  503 fails a job and exits its node nonzero, without retry or partial final
+  stats. Resubmission does not restart terminal jobs. Namespaces and DBs isolate.
+
+Each case makes **69 GETs across 68 paths**, including delayed, aborted and failed jobs.
+`report.json` records final states/counts, node diagnostics, tool/revision and
+binary/lock SHA-256s; per-case `cli.jsonl`, `result.json`, and child/server logs
+retain the observations. Failures/missing prerequisites exit nonzero, not a skip.
+
+`--crawler-tests` additionally runs the **unmodified default crawler tests**,
+its opt-in PING test on **both** servers, and the original pipeline/Redis/job/
+node/CLI/distributed suites on the owned **real Redis only**. Omit the flag for
+just the four black-box process cases. The original suites' SCAN/DEL cleanup and
+LRANGE/LSET/TTL fixtures remain incompatible with Keyper; reference-only passes
+are **not** Keyper passes. Docker managed-cluster lifecycle tests and a live
+human-assisted demo are not certified here. Core `cargo test` remains independent
+of this opt-in suite and external crawler.
+
+For the same fixture, sample results, helper roles, manual commands, reset and
+cleanup, use the tracked [interactive demo runbook](demo/README.md).
 
 ### Layout
 
@@ -846,6 +928,9 @@ Full-process one/multiple-node verification and a demo runbook remain next.
 - `tests/eval.rs`: EVAL wire semantics, error phases, isolation and concurrent atomic units.
 - `tests/compare_eval.py`: opt-in general EVAL/database comparison with owned servers.
 - `tests/compare_crawler_scripts.py`: opt-in unchanged-script components and retained-state reference checks.
+- `tests/crawler_process.py`: opt-in unchanged crawler build/CLI/node/reference orchestration.
+- `tests/crawler_fixture.py`, `tests/test_crawler_fixture.py`: owned gated HTTP oracle/demo and self-contained fixture checks.
+- `demo/README.md`: interactive server/client/crawler demo, expectations and owned cleanup.
 - `tests/lua_runtime.rs`, `tests/lua_reference.rs`: language/conversion isolation and opt-in references.
 - `tests/support/mod.rs`: owned ephemeral servers and bounded socket-test waits.
 
@@ -995,12 +1080,11 @@ normal shutdown never waits for a producer.
 
 ## Remaining work
 
-Next: full-process verification of the **unmodified** external crawler with
-controlled HTTP fixtures, one/multiple nodes and a reproducible demo runbook.
-General EVAL, transactions, the six-read snapshot, unchanged-script components,
-and combined atomic-batch/waiter regressions pass; component evidence does not
-certify process lifecycle, HTTP deduplication/concurrency, or a live demo.
+Next: final requirements/readability audit, fresh-checkout acquisition and full
+demo rehearsal. General EVAL, transactions, the six-read snapshot, unchanged
+scripts, atomic-batch/waiter regressions and four actual crawler/HTTP process
+cases pass. This does not certify a live human-assisted demo, post-demo visibility,
+grading tag or course submission; those require the owner's participation.
 Crawler sources and Git state must not be changed; compatibility code and
-harnesses belong here. Broad
-Redis compatibility, RESP3, authentication, pub/sub, and public-network hardening
-are not claimed.
+harnesses belong here. Broad Redis compatibility, RESP3, authentication, pub/sub,
+and public-network hardening are not claimed.
