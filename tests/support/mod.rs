@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use keyper::{config::Config, server};
@@ -25,7 +25,11 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> Self {
-        let listener = server::bind(Config { port: 0 }).await.unwrap();
+        Self::start_on(Config::default().bind).await
+    }
+
+    pub async fn start_on(bind: IpAddr) -> Self {
+        let listener = server::bind(Config { bind, port: 0 }).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (send, receive) = oneshot::channel();
         let task = tokio::spawn(server::serve(listener, async {

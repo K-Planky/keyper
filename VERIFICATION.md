@@ -16,9 +16,10 @@ cargo test --locked
 cargo build --locked
 ```
 
-No external Redis is required. Coverage includes RESP2 framing, CLI errors,
-all 16 databases, command semantics, ordered pipelines, blocking-pop priority and
-cleanup, timeout/disconnect races, atomic EXEC/EVAL, and fail-stop shutdown.
+No external Redis is required; **IPv4 and IPv6 loopback must be available**.
+Coverage includes bind/port validation, RESP2 framing, CLI errors, all 16 databases,
+command semantics, ordered pipelines, blocking-pop priority and cleanup,
+timeout/disconnect races, atomic EXEC/EVAL, and fail-stop shutdown.
 
 The HTTP fixture and crawler-oracle tests need Python **3.9+**, but no Redis:
 
@@ -125,14 +126,17 @@ the recorded Cargo.lock SHA-256 was
   not full Redis compatibility or other platforms. Tests and repetitions are not
   a formal proof; automatic linearizability checking is not included. See the
   [ownership and failure argument](README.md#linearizability-and-failure-contract).
+- Network tests serve clients over IPv4/IPv6 loopback; wildcard sockets are only
+  bound, not served. They do not verify LAN reachability, firewall rules, or
+  cross-machine crawling. The recorded audit predates `--bind`.
 - Original crawler integration helpers need unsupported `SCAN`, `DEL`, `LRANGE`,
   `LSET`, and `TTL`. Their Redis-only passes are not Keyper passes. Two
   Docker/interactive-PTY managed-cluster tests remain unrun.
-- The [manual demo](demo/README.md) was rehearsed using scripted processes,
+- The earlier fixture-based demo was rehearsed using scripted processes,
   `redis-cli` **7.4.0**, and `curl`: multiple clients, blocking pops, DB isolation,
   transactions/Lua, one-/three-node crawling, retained results, and empty restart.
   The main graph produced **64 GET paths, each once**. This was not a live
-  human-assisted demo.
+  human-assisted demo. See the [current walkthrough](demo/README.md) for local use.
 - Live demo/helper coordination, post-demo public visibility, crawler access for
   grading, the graded `1.0.0` tag, and LMS submission remain owner actions;
   verification does not authorize or complete them.

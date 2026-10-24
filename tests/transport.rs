@@ -175,13 +175,22 @@ async fn shutdown_closes_idle_and_partial_sessions_and_drops_listener() {
 }
 
 #[tokio::test]
-async fn explicit_port_and_occupied_bind_diagnostics() {
-    let occupied = server::bind(Config { port: 0 }).await.unwrap();
-    let port = occupied.local_addr().unwrap().port();
-    assert!(occupied.local_addr().unwrap().ip().is_loopback());
-    let error = server::bind(Config { port }).await.unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-    drop(occupied);
-    let alternate = server::bind(Config { port }).await.unwrap();
-    assert_eq!(alternate.local_addr().unwrap().port(), port);
+async fn explicit_addresses_preserve_ephemeral_fixed_and_occupied_port_behavior() {
+    // Wildcard listeners are never served: no test exposes database access to LAN peers.
+    for ip in ["127.0.0.1", "0.0.0.0", "::1", "::"] {
+        let bind = ip.parse().unwrap();
+        let occupied = server::bind(Config { bind, port: 0 }).await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        assert_eq!(address.ip(), bind);
+        assert_ne!(address.port(), 0);
+        let config = Config {
+            bind,
+            port: address.port(),
+        };
+        let error = server::bind(config).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        drop(occupied);
+        let alternate = server::bind(config).await.unwrap();
+        assert_eq!(alternate.local_addr().unwrap(), address);
+    }
 }

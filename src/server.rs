@@ -1,8 +1,8 @@
-//! Loopback TCP service and supervision. No database state lives in this layer.
+//! TCP service and supervision. No database state lives in this layer.
 
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -23,7 +23,7 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn bind(config: Config) -> io::Result<TcpListener> {
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port)).await
+    TcpListener::bind(SocketAddr::new(config.bind, config.port)).await
 }
 
 /// Serve until shutdown or an unexpected listener/task failure. Normal client

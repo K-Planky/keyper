@@ -19,7 +19,12 @@ async fn bounded<F: Future>(future: F) -> F::Output {
 
 impl TestServer {
     async fn start() -> Self {
-        let listener = bind(Config { port: 0 }).await.unwrap();
+        let listener = bind(Config {
+            port: 0,
+            ..Config::default()
+        })
+        .await
+        .unwrap();
         let address = listener.local_addr().unwrap();
         let (client, owner, waiters) = state::observed().unwrap();
         let (stop, signal) = tokio::sync::oneshot::channel();

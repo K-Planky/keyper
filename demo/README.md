@@ -17,10 +17,14 @@ cargo build --release --locked
 ./target/release/keyper
 ```
 
-Wait for `keyper: listening on 127.0.0.1:6379`. Keyper is loopback-only and intended
-for trusted local clients. If 6379 is occupied, use `--port 6380`, add `-p 6380` to
-client commands, and update the crawler URL below. Do not stop another service
-to free the port.
+Wait for `keyper: listening on 127.0.0.1:6379`. This walkthrough uses loopback.
+For `--bind IP` LAN access, first follow the
+[firewall and no-authentication warnings](../README.md#trusted-lan-access), then
+add `-h <Keyper-host-IP>` to every `redis-cli` command and use that IP instead of
+`127.0.0.1` in the crawler URL below (bracket IPv6 addresses in URLs).
+
+If 6379 is occupied, use `--port 6380`, add `-p 6380` to client commands, and update
+the crawler URL. Do not stop another service to free the port.
 
 ## 2. Read, write, and select a database
 
@@ -139,8 +143,10 @@ swarmcrawl status -f 1
 swarmcrawl stats 1
 ```
 
-Start additional nodes the same way, on this machine. No Docker, authentication,
-or crawler `cluster` commands are needed; those commands do not manage Keyper.
+Start additional local nodes the same way. For other machines, follow the
+[LAN setup](../README.md#crawler-integration) and keep the namespace identical,
+even when build/config paths differ. No Docker, authentication, or crawler
+`cluster` commands are needed; those commands do not manage Keyper.
 For deterministic local HTTP fixtures and full one-/three-node checks, see the
 [verification guide](../VERIFICATION.md#crawler-checks).
 

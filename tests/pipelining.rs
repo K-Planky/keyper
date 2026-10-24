@@ -287,6 +287,43 @@ async fn actual_client_startup_selects_all_databases_and_rejects_invalid_selecti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_bind_preserves_crawler_client_startup_eval_and_transactions() {
+    for ip in ["127.0.0.1", "::1"] {
+        let server = TestServer::start_on(ip.parse().unwrap()).await;
+        let mut client = connect(&server, 15).await.unwrap();
+        let value: i64 = bounded(
+            redis::cmd("EVAL")
+                .arg("return redis.call('INCR', KEYS[1])")
+                .arg(1)
+                .arg("counter")
+                .query_async(&mut client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 1);
+        let snapshot: (String, i64) = bounded(
+            redis::pipe()
+                .atomic()
+                .cmd("GET")
+                .arg("counter")
+                .cmd("EXISTS")
+                .arg("counter")
+                .query_async(&mut client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot, ("1".into(), 1));
+        let mut other_db = connect(&server, 0).await.unwrap();
+        let missing: Option<String> =
+            bounded(redis::cmd("GET").arg("counter").query_async(&mut other_db))
+                .await
+                .unwrap();
+        assert_eq!(missing, None);
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cloned_multiplexed_client_routes_concurrent_binary_successes_and_errors() {
     let server = TestServer::start().await;
     let client = connect(&server, 15).await.unwrap();

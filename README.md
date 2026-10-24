@@ -27,8 +27,11 @@ Start the server in one terminal:
 ./target/release/keyper --port 6380
 ```
 
-Keyper binds only to **127.0.0.1**. Omitting `--port` uses **6379**;
-`--port 0` selects an available port and prints the address. Use `--help` for usage.
+Keyper binds to **127.0.0.1** by default. Omitting `--port` uses **6379**;
+`--port 0` selects an available port and prints the address. `--bind IP` changes
+only the listening address; it does not change port behavior. Both options take
+separate values, may appear in either order, and may each be specified only once.
+Use `--help` for usage.
 
 In another terminal:
 
@@ -56,6 +59,39 @@ Other connections can keep working while a client waits.
 
 Stop Keyper with **Ctrl-C**. All data is lost when the service stops; restarting
 creates empty databases.
+
+### Trusted LAN access
+
+- **No authentication, authorization, or TLS:** anyone who can connect can read
+  and modify any database and execute Lua. Traffic is plaintext. Never expose
+  Keyper to the Internet or configure public port forwarding.
+- **Before binding beyond loopback, configure the host/network firewall** to
+  allow the chosen TCP port only from trusted client IPs, denying all others.
+  Apply this to IPv4 and IPv6 as applicable. A private IP alone is not access control.
+
+On the Keyper host, bind its **specific local LAN IP** (replace the example with
+an address assigned to that host):
+
+```sh
+./target/release/keyper --bind 192.168.1.10 --port 6380
+```
+
+From a trusted client on that LAN:
+
+```sh
+redis-cli -2 -h 192.168.1.10 -p 6380 PING
+```
+
+- `--bind` accepts one literal IPv4 or IPv6 address, not a hostname, interface
+  name, address list, or `IP:port`. IPv6 literals are unbracketed here
+  (for example, `--bind ::1`); scoped addresses such as `fe80::1%eth0` are not supported.
+- `--bind 0.0.0.0` listens on all IPv4 interfaces; `--bind ::` listens on all
+  IPv6 interfaces and may also accept IPv4 depending on the OS. Prefer a specific
+  LAN IP to these wildcard addresses. Clients connect to the host's actual IP,
+  not a wildcard address. An IPv6 listener does not promise dual-stack access.
+- Invalid arguments, missing option values, or duplicate options exit with status
+  **2**. A bind failure exits with status **1**, without falling back to loopback
+  or another port. Successful startup prints the actual listening endpoint.
 
 ## Implemented command and transport contracts
 
@@ -125,7 +161,8 @@ functioning hardware and OS; it does not provide crash recovery.
 
 ## Operational limits
 
-Use only trusted local clients and scripts. Lua has a fresh, host-restricted
+Use only trusted clients and scripts, locally or on a
+[firewall-restricted trusted LAN](#trusted-lan-access). Lua has a fresh, host-restricted
 environment per invocation, but **no time or heap quota**. A long or infinite
 script stalls database work across all namespaces.
 
@@ -150,7 +187,8 @@ cargo test --locked
 cargo build --locked
 ```
 
-Core tests start isolated servers and need no external Redis. They cover framing,
+Core tests require working **IPv4 and IPv6 loopback**, but no external Redis.
+They cover bind/port validation and startup diagnostics, framing,
 database isolation, command semantics, ordered pipelines, blocking races,
 transactions, Lua, and shutdown. Tests are evidence, not a formal linearizability
 proof; automatic history checking is not included.
@@ -169,6 +207,19 @@ a credential-free `SWARMCRAWL_REDIS_URL` (for example,
 `redis://127.0.0.1:6380/15`) and `SWARMCRAWL_JOB_NAMESPACE`. Point
 `SWARMCRAWL_CONFIG_DIR` at an absent disposable directory to avoid saved deployment
 settings. Build outputs and runtime state stay outside the crawler checkout.
+
+For nodes or CLI processes on other trusted LAN machines, follow the
+[LAN firewall/security guidance](#trusted-lan-access) above and set the same
+credential-free endpoint on **every** crawler client, for example:
+
+```sh
+export SWARMCRAWL_REDIS_URL=redis://192.168.1.10:6380/15
+```
+
+Use the Keyper host's actual reachable IP and selected port, retaining the shared
+database and namespace. IPv6 URLs require brackets, for example
+`redis://[fd00::10]:6380/15`. Existing crawler flags/environment settings suffice;
+do not use its authenticated Docker `cluster init/join` path to manage Keyper.
 
 Follow the [reproduction guide](VERIFICATION.md#reproduce-from-fresh-source) for
 source acquisition, exact script checks, and full-process one-/three-node

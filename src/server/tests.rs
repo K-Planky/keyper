@@ -4,7 +4,12 @@ use super::*;
 
 #[tokio::test]
 async fn owner_panic_stops_even_idle_connections_instead_of_replacing_state() {
-    let listener = bind(Config { port: 0 }).await.unwrap();
+    let listener = bind(Config {
+        port: 0,
+        ..Config::default()
+    })
+    .await
+    .unwrap();
     let address = listener.local_addr().unwrap();
     let (fail, signal) = tokio::sync::oneshot::channel();
     let owner = state::failing_owner(signal).unwrap();
