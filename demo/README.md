@@ -1,238 +1,156 @@
-# Keyper + unchanged swarmcrawl demo
+# Keyper walkthrough
 
-A local, repeatable multi-client/multi-node demonstration. The site and all
-compatibility assets live in **Keyper**, not the crawler. Use only trusted local
-code/endpoints. This runbook does not authorize a grading tag, public visibility,
-or course submission; arrange the live helper/demo with the owner separately.
+Run Keyper as a normal local service, then try it from several clients.
+Connecting swarmcrawl is optional; Keyper needs neither a crawler nor a separate
+Redis server.
 
-## Prerequisites and roles
+Use the [build prerequisites](../README.md#prerequisites-and-build) and install
+`redis-cli` for the client examples. All commands start from the **Keyper root**.
+Examples assume fresh `demo:*` keys; use a different prefix when repeating them.
 
-- Keyper's [build tools](../README.md#prerequisites-and-build), Python **3.9+**,
-  `curl`, and `redis-cli` (RESP2; verified with 7.4.0).
-- A clean, unmodified [swarmcrawl checkout](https://github.com/K-Planky/swarmcrawl)
-  at **f2c3a591af66e9a424178d9fbc5836740a71e896**. See the
-  [acquisition commands](../README.md#optional-unchanged-crawler-script-components).
-  Access may require owner permission. Never switch/edit an existing checkout to
-  prepare this demo; obtain a separate matching checkout if needed.
-- On one machine, reserve loopback **6380** (Keyper) and **8000** (HTTP). If either
-  is occupied, choose another port and update every command. Never stop an
-  unrelated deployment to free a port.
-- **Presenter:** server/CLI and first node. **Helper:** second/third nodes,
-  blocking-pop producer and HTTP gate release. Use separate terminals; all
-  commands below start from the **Keyper root**, never the crawler checkout.
-
-The automated [process suite](../README.md#optional-full-process-crawler-verification)
-checks this graph plus delayed completion, abort/failure and per-node diagnostics
-against an owned Redis baseline. It is the correctness check; manual observations
-supplement it, not a proof or a claim the live demo already occurred.
-
-## 1. Prepare external build/runtime space
-
-In the setup terminal (replace the source path):
-
-```sh
-export CRAWLER_SRC=/absolute/path/to/unmodified/swarmcrawl
-export DEMO_WORK=$(mktemp -d /tmp/keyper-demo-XXXXXX)
-printf 'Share this DEMO_WORK with every terminal: %s\n' "$DEMO_WORK"
-GIT_OPTIONAL_LOCKS=0 git -C "$CRAWLER_SRC" status --porcelain=v1 --untracked-files=all
-git -C "$CRAWLER_SRC" rev-parse HEAD
-# Require no status output and exactly the revision above.
-cargo build --locked
-cargo +1.99.0 build --release --locked \
-  --manifest-path "$CRAWLER_SRC/Cargo.toml" --target-dir "$DEMO_WORK/crawler-target"
-```
-
-The crawler manifest/lockfile/source remain untouched; builds are outside its
-checkout. In **every CLI/node terminal**, paste the same actual path and a new,
-matching namespace (use another name for a repeat):
-
-```sh
-export DEMO_WORK=/tmp/keyper-demo-REPLACE_WITH_PRINTED_NAME
-export PATH="$DEMO_WORK/crawler-target/release:$PATH"
-export SWARMCRAWL_CONFIG_DIR="$DEMO_WORK/absent-config"
-export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6380/15
-export SWARMCRAWL_JOB_NAMESPACE=keyper-demo-three-1
-export SWARMCRAWL_REDIS_TIMEOUT_SECS=5
-export SWARMCRAWL_FETCH_TIMEOUT_SECS=300
-unset SWARMCRAWL_DIAGNOSTICS
-```
-
-`absent-config` must not exist: this prevents loading unrelated saved deployment
-metadata. No credentials, AUTH, RESP3, Docker, or crawler `cluster` commands are
-used. Those lifecycle commands manage a different deployment, not Keyper.
-
-## 2. Start servers and show several clients
+## 1. Start Keyper
 
 In the server terminal:
 
 ```sh
-./target/debug/keyper --port 6380
+cargo build --release --locked
+./target/release/keyper
 ```
 
-In the HTTP terminal:
+Wait for `keyper: listening on 127.0.0.1:6379`. Keyper is loopback-only and intended
+for trusted local clients. If 6379 is occupied, use `--port 6380`, add `-p 6380` to
+client commands, and update the crawler URL below. Do not stop another service
+to free the port.
+
+## 2. Read, write, and select a database
+
+In a client terminal:
 
 ```sh
-python3 tests/crawler_fixture.py --port 8000
+redis-cli -2 PING                         # PONG
+redis-cli -2 SET demo:message hello       # OK
+redis-cli -2 GET demo:message             # "hello"
+redis-cli -2 EXISTS demo:message          # 1
+redis-cli -2 -n 15 GET demo:message        # (nil)
+redis-cli -2 GET demo:message             # "hello": DB 0 is unchanged
 ```
 
-Wait for both startup messages. HTTP binds only to loopback and holds leaf HTML
-bodies until release; **gates fail after 300 seconds**, so release promptly.
-Do not browse or curl crawl URLs: extra requests change the request oracle.
-The `/_fixture/` control endpoints do not count as crawl requests.
+There are 16 independent databases, numbered **0–15**. Each command above opens
+a fresh connection; `-n 15` selects DB 15 at connection startup. An interactive
+client cannot SELECT after sending another command. SET accepts no options.
 
-Show independent databases and startup selection using fresh clients:
+Try both ends of a list:
 
 ```sh
-redis-cli -2 -p 6380 SET demo:key zero
-redis-cli -2 -p 6380 -n 15 GET demo:key       # (nil)
-redis-cli -2 -p 6380 GET demo:key             # "zero"
+redis-cli -2 LPUSH demo:list left right   # 2
+redis-cli -2 BLPOP demo:list 1            # demo:list / right
+redis-cli -2 BRPOP demo:list 1            # demo:list / left
 ```
 
-In one client terminal, block (five-second timeout):
+## 3. Block one client, keep another working
+
+In the first client terminal:
 
 ```sh
-redis-cli -2 -p 6380 BLPOP demo:queue 5
+redis-cli -2 BLPOP demo:queue 30
 ```
 
-The helper uses another terminal promptly:
+Before the 30-second timeout, use a second client terminal:
 
 ```sh
-redis-cli -2 -p 6380 PING
-redis-cli -2 -p 6380 RPUSH demo:queue first second
-redis-cli -2 -p 6380 BRPOP demo:queue 1
-redis-cli -2 -p 6380 BLPOP demo:empty 0.25    # (nil), no earlier than timeout
+redis-cli -2 PING                         # PONG while the other client waits
+redis-cli -2 RPUSH demo:queue first second # 2
+redis-cli -2 BRPOP demo:queue 1            # demo:queue / second
+redis-cli -2 BLPOP demo:empty 0.25         # (nil), after at least 0.25 seconds
 ```
 
-The blocked client receives `demo:queue / first`, push length is **2**, and
-BRPOP receives `second`. PING/other connections progress while a client waits.
-If the five-second wait expired before the push, repeat with a new queue name;
-do not mislabel that schedule as a server failure. Core demo keys are in DB 0;
-the crawler below uses DB 15.
+The first client receives `demo:queue / first`. RPUSH returns **2** because the
+entire push finishes before the waiting pop consumes an item. A waiting client
+does not hold database access; other connections can progress.
 
-## 3. Submit two jobs before starting nodes
+If the first wait expires before the push, repeat with a new queue key. Blocking
+pops accept at most **five key arguments**; timeout **0** waits indefinitely.
 
-In the configured CLI terminal:
+## 4. Try transactions and Lua
+
+Send the transaction on one connection:
 
 ```sh
+redis-cli -2 <<'COMMANDS'
+MULTI
+SET demo:counter 10
+INCR demo:counter
+GET demo:counter
+EXEC
+COMMANDS
+
+redis-cli -2 EVAL "return redis.call('INCR', KEYS[1])" 1 demo:counter
+```
+
+EXEC returns the three results: `OK`, `11`, and `"11"`. EVAL then returns **12**.
+Each EXEC or EVAL runs without interleaving with another client's database work.
+Runtime errors do not roll back earlier writes. Only run trusted scripts: Lua
+has no time or heap quota.
+
+## Optional: connect swarmcrawl
+
+Keep Keyper running. Use a clean, unchanged swarmcrawl checkout at
+`f2c3a591af66e9a424178d9fbc5836740a71e896`; see
+[source acquisition](../VERIFICATION.md#reproduce-from-fresh-source) if needed.
+Replace the source path below. Build outputs stay outside the crawler checkout;
+skip the Cargo build if a matching `swarmcrawl` binary is already on PATH:
+
+```sh
+export CRAWLER_SRC=/absolute/path/to/unmodified/swarmcrawl
+DEMO_WORK=$(mktemp -d /tmp/keyper-demo-XXXXXX)
+printf 'Use this directory in every crawler terminal: %s\n' "$DEMO_WORK"
+cargo +1.99.0 build --release --locked \
+  --manifest-path "$CRAWLER_SRC/Cargo.toml" --target-dir "$DEMO_WORK/crawler-target"
+```
+
+Stop if the build fails. In **each crawler terminal**, set `DEMO_WORK` to that
+same printed path, then run:
+
+```sh
+export PATH="$DEMO_WORK/crawler-target/release:$PATH"
+export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/15
+export SWARMCRAWL_JOB_NAMESPACE="${DEMO_WORK##*/}"
+export SWARMCRAWL_CONFIG_DIR="$DEMO_WORK/absent-config"
 swarmcrawl check
-swarmcrawl submit http://127.0.0.1:8000/a/ http://127.0.0.1:8000/b/
-swarmcrawl submit 'http://127.0.0.1:8000/a/#duplicate'
-swarmcrawl jobs
-swarmcrawl stats 1
 ```
 
-On a fresh namespace IDs are **1 and 2**; substitute the printed IDs otherwise.
-The duplicate returns job 1's **existing** ID. Initially each job is running with
-0 crawled, frontier 1, in-flight 0, discovered 1. `stats` must exit nonzero with
-an unfinished-job message, not print partial totals. CLI commands fetch no HTTP.
+Expect `Redis connectivity: OK (PONG)`. The absent config directory avoids loading
+saved deployment settings; do not create it. All crawler processes must use the
+same endpoint, database, and namespace. This setup uses DB **15**, separate from
+the Keyper examples in DB 0, and a fresh namespace for each new `DEMO_WORK`.
 
-## 4. Launch three nodes; inspect and follow
-
-In **three separate configured node terminals**:
+Start a worker in one configured terminal:
 
 ```sh
-swarmcrawl node --diagnostics
+swarmcrawl node
 ```
 
-Wait for each node-ready message. Nodes remain available for later jobs. In CLI:
+In another configured terminal, submit a site you are authorized to crawl.
+Replace the example URL and use the printed job ID instead of `1` if different:
 
 ```sh
-swarmcrawl jobs
-swarmcrawl status 1
-swarmcrawl stats 1
-curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/_fixture/state | python3 -m json.tool
+swarmcrawl submit https://your-site.example/docs/
 swarmcrawl status -f 1
-```
-
-The two jobs remain running while leaf bodies are held. HTTP `held` counts can
-reach **30 across three nodes** (ten with one node). Aggregate counts do not
-independently establish each node's cap; the automated suite checks per-node
-HTTP diagnostics, body-held concurrency and request counts together. Follow
-prints coherent changes and waits; it must not invent final results.
-
-The helper releases the main gate in a different terminal:
-
-```sh
-curl --fail --silent --show-error --max-time 5 -X POST http://127.0.0.1:8000/_fixture/release/main
-```
-
-Then in CLI:
-
-```sh
-swarmcrawl status -f 2
 swarmcrawl stats 1
-swarmcrawl stats 2
-curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/_fixture/state | python3 -m json.tool
 ```
 
-Each job finishes with **32 crawled/discovered, 0 frontier/in-flight, 30 files**.
-Both final statistics are immediately readable:
+Start additional nodes the same way, on this machine. No Docker, authentication,
+or crawler `cluster` commands are needed; those commands do not manage Keyper.
+For deterministic local HTTP fixtures and full one-/three-node checks, see the
+[verification guide](../VERIFICATION.md#crawler-checks).
 
-```text
-files: 30   extensions: 4   words: 52
-  html 27
-  jpeg 1
-  jpg 1
-  pdf 1
-```
+## Shut down
 
-Hand-countable contributions per job:
+If using swarmcrawl, press **Ctrl-C in each node terminal** and wait for it to
+drain. Final statistics remain readable with `swarmcrawl stats <job-id>` while
+Keyper is running. Then press **Ctrl-C in the Keyper terminal**.
 
-| Content | Files | HTML words |
-| --- | ---: | ---: |
-| Index (`Alpha beta`) | 1 | 2 |
-| 24 gated leaves (`Leaf words`) | 24 | 48 |
-| Shared page (`Shared end`) | 1 | 2 |
-| JPG, JPEG, PDF, extensionless binary | 4 | 0 |
-| Redirect to an existing leaf and 404 | 0 | 0 |
-| **Total** | **30** | **52** |
-
-The extensionless binary has extension `html` but no HTML words. Empty anchors,
-comments and attributes add no words. Duplicate/fragment links, cycles, a
-redirect, cross-job/out-of-scope links and convergent shared-page discovery test
-the scope/dedup boundary. `get_counts` should show **64 paths, each once**, no
-`/outside.html`; `errors` empty, `active` and all `held` counts zero.
-
-Optional empty-frontier demonstration (nodes still running):
-
-```sh
-swarmcrawl submit http://127.0.0.1:8000/delay/  # next ID, normally 3
-swarmcrawl status 3
-swarmcrawl stats 3
-# Wait for /delay/ held=1: frontier=0, in-flight=1 must remain running.
-curl --fail --silent --show-error --max-time 5 -X POST http://127.0.0.1:8000/_fixture/release/delay
-swarmcrawl status -f 3
-swarmcrawl stats 3
-```
-
-Its final result is **2 files, html 2, 4 words**; only the held parent can reveal
-the child. A momentary empty queue is not completion.
-
-## 5. Drain, retain, reset and clean up
-
-Release any remaining gates first (also use this after a failed/abandoned run):
-
-```sh
-curl --fail --silent --show-error --max-time 5 -X POST http://127.0.0.1:8000/_fixture/release/all
-```
-
-Press **Ctrl-C in every node terminal** and wait for `drained; exiting` and the
-numeric `swarmcrawl_metrics` line. Each HTTP peak should be ≤10 and all active
-gauges zero after drain; startup/idle time affects timing fields. While Keyper
-still runs, read `swarmcrawl stats 1` again from a fresh CLI process: results
-remain retained. Then Ctrl-C the HTTP fixture and finally Keyper. No persistent
-data survive stopping Keyper; no recovery or exactly-once crash semantics are
-promised.
-
-To compare **one node**, restart the HTTP fixture (resets counts/re-arms gates),
-use a **new matching namespace in every CLI/node terminal**, and repeat steps
-3–5 with one node. The same two jobs must produce the same totals and 64 unique
-GETs; at most ten bodies are held at once. A namespace does not reset HTTP
-counts. Resubmitting a retained done/failed/aborted URL does not restart it.
-
-After all owned processes have stopped, verify the crawler revision/clean status
-again with step 1's read-only Git commands. Inspect and remove only the exact
-`DEMO_WORK` directory you created if no longer needed. Never use FLUSHALL,
-`swarmcrawl cluster stop/remove`, `pkill`, or cleanup against another deployment.
-If a node cannot drain, preserve its logs and report the failure; force-killing
-an owned node is not a successful graceful demo and can strand work.
+Stopping Keyper loses **all data in every database**. Starting it again creates
+empty databases; `redis-cli -2 GET demo:message` returns `(nil)` after restart.
+Remove only the scratch directory you created, after its processes have stopped;
+never clear another deployment or use crawler cluster-management commands for cleanup.
