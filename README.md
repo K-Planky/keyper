@@ -201,12 +201,12 @@ and opt-in Redis **7.4.x** comparisons. Linux x86_64 is the verified platform.
 
 ## Crawler integration
 
-The audited unchanged crawler revision is
+The audited unchanged [swarmcrawl](https://github.com/K-Planky/swarmcrawl) revision is
 `f2c3a591af66e9a424178d9fbc5836740a71e896`. All nodes and CLI processes must share
 a credential-free `SWARMCRAWL_REDIS_URL` (for example,
-`redis://127.0.0.1:6380/15`) and `SWARMCRAWL_JOB_NAMESPACE`. Point
-`SWARMCRAWL_CONFIG_DIR` at an absent disposable directory to avoid saved deployment
-settings. Build outputs and runtime state stay outside the crawler checkout.
+`redis://127.0.0.1:6380/15`) and namespace. To ignore saved deployment settings,
+optionally point `SWARMCRAWL_CONFIG_DIR` at an absent disposable directory.
+Build outputs and runtime state stay outside the crawler checkout.
 
 For nodes or CLI processes on other trusted LAN machines, follow the
 [LAN firewall/security guidance](#trusted-lan-access) above and set the same

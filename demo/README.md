@@ -5,8 +5,9 @@ Connecting swarmcrawl is optional; Keyper needs neither a crawler nor a separate
 Redis server.
 
 Use the [build prerequisites](../README.md#prerequisites-and-build) and install
-`redis-cli` for the client examples. All commands start from the **Keyper root**.
-Examples assume fresh `demo:*` keys; use a different prefix when repeating them.
+`redis-cli` for the client examples. Start each terminal in the **Keyper root**;
+the crawler section switches to the sibling **swarmcrawl directory**. Examples
+assume fresh `demo:*` keys; use a different prefix when repeating them.
 
 ## 1. Start Keyper
 
@@ -98,37 +99,24 @@ has no time or heap quota.
 
 ## Optional: connect swarmcrawl
 
-Keep Keyper running. Use a clean, unchanged swarmcrawl checkout at
-`f2c3a591af66e9a424178d9fbc5836740a71e896`; see
-[source acquisition](../VERIFICATION.md#reproduce-from-fresh-source) if needed.
-Replace the source path below. Build outputs stay outside the crawler checkout;
-skip the Cargo build if a matching `swarmcrawl` binary is already on PATH:
+Keep Keyper running. With swarmcrawl already built, run this in **each new
+terminal opened in the Keyper directory**:
 
 ```sh
-export CRAWLER_SRC=/absolute/path/to/unmodified/swarmcrawl
-DEMO_WORK=$(mktemp -d /tmp/keyper-demo-XXXXXX)
-printf 'Use this directory in every crawler terminal: %s\n' "$DEMO_WORK"
-cargo +1.99.0 build --release --locked \
-  --manifest-path "$CRAWLER_SRC/Cargo.toml" --target-dir "$DEMO_WORK/crawler-target"
-```
-
-Stop if the build fails. In **each crawler terminal**, set `DEMO_WORK` to that
-same printed path, then run:
-
-```sh
-export PATH="$DEMO_WORK/crawler-target/release:$PATH"
-export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/15
-export SWARMCRAWL_JOB_NAMESPACE="${DEMO_WORK##*/}"
-export SWARMCRAWL_CONFIG_DIR="$DEMO_WORK/absent-config"
+cd ../swarmcrawl
+export PATH="$PWD/target/release:$PATH"
 swarmcrawl check
 ```
 
-Expect `Redis connectivity: OK (PONG)`. The absent config directory avoids loading
-saved deployment settings; do not create it. All crawler processes must use the
-same endpoint, database, and namespace. This setup uses DB **15**, separate from
-the Keyper examples in DB 0, and a fresh namespace for each new `DEMO_WORK`.
+Expect `Redis connectivity: OK (PONG)`. No Redis URL export is needed if your
+existing settings already point to Keyper. All terminals must use the same
+endpoint, database, and namespace.
 
-Start a worker in one configured terminal:
+If needed, run `export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/15` before
+`swarmcrawl check` to use Keyper on port 6379 with DB **15**, separate from the
+examples in DB 0.
+
+Start a worker in one terminal:
 
 ```sh
 swarmcrawl node
@@ -143,12 +131,31 @@ swarmcrawl status -f 1
 swarmcrawl stats 1
 ```
 
-Start additional local nodes the same way. For other machines, follow the
-[LAN setup](../README.md#crawler-integration) and keep the namespace identical,
-even when build/config paths differ. No Docker, authentication, or crawler
-`cluster` commands are needed; those commands do not manage Keyper.
-For deterministic local HTTP fixtures and full one-/three-node checks, see the
-[verification guide](../VERIFICATION.md#crawler-checks).
+Start more nodes the same way. No Docker or crawler `cluster` commands are
+needed; those commands do not manage Keyper. For LAN access and the tested
+crawler revision, see [crawler integration](../README.md#crawler-integration).
+
+For a fresh crawl, optionally run `export SWARMCRAWL_JOB_NAMESPACE=keyper-demo-2`
+in every terminal before starting nodes or submitting jobs. Otherwise,
+resubmitting the same URL reuses its job.
+
+<details>
+<summary>Optional: use a temporary directory</summary>
+
+To ignore saved settings and use a fresh namespace, run
+`mktemp -d /tmp/keyper-demo-XXXXXX` once. In every crawler terminal, replace the
+path below with its output before starting nodes or submitting jobs:
+
+```sh
+DEMO_WORK=/tmp/keyper-demo-XXXXXX
+export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/15
+export SWARMCRAWL_JOB_NAMESPACE="${DEMO_WORK##*/}"
+export SWARMCRAWL_CONFIG_DIR="$DEMO_WORK/absent-config"
+```
+
+Leave `absent-config` uncreated so the crawler does not load saved settings.
+
+</details>
 
 ## Shut down
 
@@ -158,5 +165,6 @@ Keyper is running. Then press **Ctrl-C in the Keyper terminal**.
 
 Stopping Keyper loses **all data in every database**. Starting it again creates
 empty databases; `redis-cli -2 GET demo:message` returns `(nil)` after restart.
-Remove only the scratch directory you created, after its processes have stopped;
-never clear another deployment or use crawler cluster-management commands for cleanup.
+If you used a temporary directory, remove only that directory after its processes
+have stopped. Never clear another deployment or use crawler cluster-management
+commands for cleanup.
